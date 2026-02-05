@@ -18,7 +18,11 @@ from openai import OpenAI
 from requests import exceptions as req_exc
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from ..utils.path import HY_MOTION_ROOT
 from .model_constants import REWRITE_AND_INFER_TIME_PROMPT_FORMAT
+
+# Default prompter model path (absolute)
+_DEFAULT_PROMPTER_PATH = str(HY_MOTION_ROOT / "ckpts" / "Text2MotionPrompter")
 
 # logging.basicConfig(level=logging.INFO)
 
@@ -261,7 +265,7 @@ class PromptRewriter:
                 )
             )
         else:
-            self.model_path = model_path or "./ckpts/Text2MotionPrompter"
+            self.model_path = model_path or _DEFAULT_PROMPTER_PATH
             self.tokenizer = None
             self.model = None
             self._load_model()

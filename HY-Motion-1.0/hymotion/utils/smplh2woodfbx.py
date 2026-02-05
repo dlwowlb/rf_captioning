@@ -2,6 +2,7 @@ import glob
 import os
 import shutil
 import tempfile
+from pathlib import Path
 from typing import Dict, Optional
 
 import fbx
@@ -10,6 +11,10 @@ import torch
 from transforms3d.euler import mat2euler
 
 from .geometry import angle_axis_to_rotation_matrix, rot6d_to_rotation_matrix, rotation_matrix_to_angle_axis
+from .path import HY_MOTION_ROOT
+
+# Default FBX template path (absolute)
+_DEFAULT_FBX_TEMPLATE = str(HY_MOTION_ROOT / "assets" / "wooden_models" / "boy_Rigging_smplx_tex.fbx")
 
 # yapf: disable
 SMPLH_JOINT2NUM = {
@@ -465,9 +470,7 @@ class SMPLH2WoodFBX:
     No SMPL-H model assets (model.npz) required.
 
     Example usage:
-        converter = SMPLH2WoodFBX(
-            template_fbx_path="./assets/wooden_models/boy_Rigging_smplx.fbx"
-        )
+        converter = SMPLH2WoodFBX()  # Uses default template from HY-Motion assets
 
         # From npz file
         converter.convert_npz_to_fbx("motion.npz", "output.fbx", fps=30)
@@ -482,7 +485,7 @@ class SMPLH2WoodFBX:
 
     def __init__(
         self,
-        template_fbx_path: str = "./assets/wooden_models/boy_Rigging_smplx_tex.fbx",
+        template_fbx_path: str = None,
         smplh_to_fbx_mapping: Optional[Dict[str, str]] = None,
         scale: float = 100,
     ):
@@ -490,10 +493,13 @@ class SMPLH2WoodFBX:
         Initialize the converter.
 
         Args:
-            template_fbx_path: Path to the template FBX file
+            template_fbx_path: Path to the template FBX file (default: uses HY-Motion assets)
             smplh_to_fbx_mapping: Custom mapping from SMPL-H joint names to FBX node names
             scale: Scale factor for translation (default 100 for m to cm conversion)
         """
+        # Use default template path if not specified
+        if template_fbx_path is None:
+            template_fbx_path = _DEFAULT_FBX_TEMPLATE
         print(f"[{self.__class__.__name__}] Template FBX: {template_fbx_path}")
         self.template_fbx_path = template_fbx_path
         self.smplh_to_fbx_mapping = smplh_to_fbx_mapping
@@ -610,7 +616,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     converter = SMPLH2WoodFBX(
-        template_fbx_path="./assets/wooden_models/boy_Rigging_smplx_tex.fbx",
+        template_fbx_path=None,  # Uses default path from HY_MOTION_ROOT
         scale=100,
     )
 

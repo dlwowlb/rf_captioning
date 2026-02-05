@@ -11,6 +11,7 @@ from transformers import (
     CLIPTokenizer,
 )
 
+from ...utils.path import HY_MOTION_ROOT
 from ...utils.type_converter import get_module_device
 from .model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
@@ -20,8 +21,9 @@ if USE_HF_MODELS:
     QWEN_PATH = "Qwen/Qwen3-8B"
     CLIP_PATH = "openai/clip-vit-large-patch14"
 else:
-    QWEN_PATH = "ckpts/Qwen3-8B"
-    CLIP_PATH = "ckpts/clip-vit-large-patch14"
+    # Use absolute paths based on HY-Motion root
+    QWEN_PATH = str(HY_MOTION_ROOT / "ckpts" / "Qwen3-8B")
+    CLIP_PATH = str(HY_MOTION_ROOT / "ckpts" / "clip-vit-large-patch14")
 
 LLM_ENCODER_LAYOUT = {
     "qwen3": {

@@ -18,6 +18,7 @@ from ..utils.geometry import (
 )
 from ..utils.loaders import load_object
 from ..utils.motion_process import smooth_rotation
+from ..utils.path import resolve_hymotion_path
 from ..utils.type_converter import get_module_device
 from .body_model import WoodenMesh
 
@@ -127,8 +128,8 @@ class MotionGeneration(torch.nn.Module):
         self.special_game_ctxt_feat = torch.nn.Parameter(
             torch.randn(1, 1, self._network_module_args.get("ctxt_input_dim", 4096))
         )
-        # build buffer
-        self.mean_std_dir = mean_std_dir
+        # build buffer - resolve relative paths to absolute
+        self.mean_std_dir = str(resolve_hymotion_path(mean_std_dir)) if mean_std_dir else None
         self._parse_buffer(self.motion_type)
 
         self.output_mesh_fps = kwargs.get("output_mesh_fps", 30)

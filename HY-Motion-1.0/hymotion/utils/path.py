@@ -6,6 +6,58 @@ from typing import Any, Generator, List, Optional, Union
 
 from .misc import is_str
 
+# ============================================================================
+# HY-Motion Root Path - computed relative to this file
+# ============================================================================
+_THIS_FILE = Path(__file__).resolve()
+_UTILS_DIR = _THIS_FILE.parent  # hymotion/utils/
+_HYMOTION_DIR = _UTILS_DIR.parent  # hymotion/
+HY_MOTION_ROOT = _HYMOTION_DIR.parent  # HY-Motion-1.0/
+
+
+def resolve_path(path: Union[str, Path], base_dir: Union[str, Path] = None) -> Path:
+    """
+    Resolve a path to an absolute path.
+
+    If the path is relative (starts with './' or '../' or doesn't start with '/' on Unix
+    or drive letter on Windows), it will be resolved relative to base_dir.
+
+    Args:
+        path: The path to resolve (can be relative or absolute)
+        base_dir: The base directory for relative paths. Defaults to HY_MOTION_ROOT.
+
+    Returns:
+        Absolute Path object
+    """
+    if base_dir is None:
+        base_dir = HY_MOTION_ROOT
+
+    path = Path(path)
+
+    # If already absolute, return as-is
+    if path.is_absolute():
+        return path
+
+    # Convert relative path to absolute based on base_dir
+    return (Path(base_dir) / path).resolve()
+
+
+def resolve_hymotion_path(path: Union[str, Path, None]) -> Optional[Path]:
+    """
+    Resolve a path relative to HY-Motion root directory.
+
+    This is useful for config values that use relative paths like './stats/' or 'ckpts/'.
+
+    Args:
+        path: The path to resolve, or None
+
+    Returns:
+        Absolute Path object, or None if input was None
+    """
+    if path is None:
+        return None
+    return resolve_path(path, HY_MOTION_ROOT)
+
 if platform.system() == "Windows":
     import regex as re
 else:
