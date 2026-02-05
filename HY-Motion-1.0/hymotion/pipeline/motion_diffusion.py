@@ -18,6 +18,7 @@ from ..utils.geometry import (
 )
 from ..utils.loaders import load_object
 from ..utils.motion_process import smooth_rotation
+from ..utils.path import resolve_hymotion_path
 from ..utils.type_converter import get_module_device
 from .body_model import WoodenMesh
 
@@ -91,8 +92,9 @@ def randn_tensor(
         ]
         latents = torch.cat(latents, dim=0).to(device)
     else:
-        latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout).to(device)
-
+        #latents = torch.randn(shape, generator=generator, device=rand_device, dtype=dtype, layout=layout).to(device)
+        gen_device = generator.device if generator is not None else rand_device
+        latents = torch.randn(shape, generator=generator, device=gen_device, dtype=dtype, layout=layout).to(device)
     return latents
 
 
@@ -128,7 +130,7 @@ class MotionGeneration(torch.nn.Module):
             torch.randn(1, 1, self._network_module_args.get("ctxt_input_dim", 4096))
         )
         # build buffer
-        self.mean_std_dir = mean_std_dir
+        self.mean_std_dir = str(resolve_hymotion_path(mean_std_dir)) if mean_std_dir else None
         self._parse_buffer(self.motion_type)
 
         self.output_mesh_fps = kwargs.get("output_mesh_fps", 30)

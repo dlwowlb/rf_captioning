@@ -22,7 +22,7 @@ def apply_translation(vertices, translation_matrix):
 def call_smpl_layer(pose_params, shape_params,body, need_face = False,transform = None): # Torch Tensor pose_params: (Batch, 72), shape_params: (Batch, 10)
 
 
-    vertices, Jtr = body(pose_params, th_betas=shape_params) # (Batch, 6890, 3), (Batch, 24, 3)
+    vertices, Jtr = body(pose_params.float(), th_betas=shape_params.float()) # (Batch, 6890, 3), (Batch, 24, 3)
 
     # remove the batch dimension
     if len(vertices.shape)==3:

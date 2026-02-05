@@ -73,7 +73,7 @@ class RawDataReader:
         self.ADCBinFile.close()
 
 def bin2np_frame(bin_frame): #
-    np_frame=np.zeros(shape=(len(bin_frame)//2), dtype=np.complex_)
+    np_frame=np.zeros(shape=(len(bin_frame)//2), dtype=np.complex128)
     np_frame[0::2] = bin_frame[0::4]+1j*bin_frame[2::4]
     np_frame[1::2] = bin_frame[1::4]+1j*bin_frame[3::4]
     return np_frame
@@ -108,13 +108,13 @@ def naive_xyz(virtual_ant, num_tx=3, num_rx=4, fft_size=64): #
     assert num_tx > 2, "need a config for more than 2 TXs"
     num_detected_obj = virtual_ant.shape[1]
     azimuth_ant = virtual_ant[:2 * num_rx, :]
-    azimuth_ant_padded = np.zeros(shape=(fft_size, num_detected_obj), dtype=np.complex_)
+    azimuth_ant_padded = np.zeros(shape=(fft_size, num_detected_obj), dtype=np.complex128)
     azimuth_ant_padded[:2 * num_rx, :] = azimuth_ant
 
     # Process azimuth information
     azimuth_fft = np.fft.fft(azimuth_ant_padded, axis=0)
     k_max = np.argmax(np.abs(azimuth_fft), axis=0)
-    peak_1 = np.zeros_like(k_max, dtype=np.complex_)
+    peak_1 = np.zeros_like(k_max, dtype=np.complex128)
     for i in range(len(k_max)):
         peak_1[i] = azimuth_fft[k_max[i], i]
 
@@ -125,13 +125,13 @@ def naive_xyz(virtual_ant, num_tx=3, num_rx=4, fft_size=64): #
 
     # Zero pad elevation
     elevation_ant = virtual_ant[2 * num_rx:, :]
-    elevation_ant_padded = np.zeros(shape=(fft_size, num_detected_obj), dtype=np.complex_)
+    elevation_ant_padded = np.zeros(shape=(fft_size, num_detected_obj), dtype=np.complex128)
     elevation_ant_padded[:num_rx, :] = elevation_ant
 
     # Process elevation information
     elevation_fft = np.fft.fft(elevation_ant_padded, axis=0)
     elevation_max = np.argmax(np.log2(np.abs(elevation_fft)), axis=0)  # shape = (num_detected_obj, )
-    peak_2 = np.zeros_like(elevation_max, dtype=np.complex_)
+    peak_2 = np.zeros_like(elevation_max, dtype=np.complex128)
     for i in range(len(elevation_max)):
         peak_2[i] = elevation_fft[elevation_max[i], i]
  

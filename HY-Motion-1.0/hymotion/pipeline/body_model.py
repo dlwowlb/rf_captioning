@@ -12,6 +12,12 @@ from ..utils.geometry import (
     rotation_matrix_to_angle_axis,
 )
 
+# Compute default model path relative to this file
+_THIS_DIR = Path(__file__).resolve().parent
+_HY_MOTION_ROOT = _THIS_DIR.parent.parent  # hymotion/pipeline -> HY-Motion-1.0
+_DEFAULT_MODEL_PATH = _HY_MOTION_ROOT / "scripts" / "gradio" / "static" / "assets" / "dump_wooden"
+ 
+
 # yapf: disable
 LEFT_HAND_MEAN_AA = [ 0.1117,  0.0429, -0.4164,  0.1088, -0.0660, -0.7562, -0.0964, -0.0909,
         -0.1885, -0.1181,  0.0509, -0.5296, -0.1437,  0.0552, -0.7049, -0.0192,
@@ -222,7 +228,10 @@ class WoodenMesh(torch.nn.Module):
     Uses simple LBS without shape blending (fixed skeleton).
     """
 
-    def __init__(self, model_path="scripts/gradio/static/assets/dump_wooden"):
+    def __init__(self, model_path=None):
+        # Use default path relative to this file if not specified
+        if model_path is None:
+            model_path = _DEFAULT_MODEL_PATH
         torch.nn.Module.__init__(self)
 
         # Load model data from .bin files
@@ -390,8 +399,7 @@ def construct_smpl_data_dict(
 
 if __name__ == "__main__":
     # python -m hymotion.pipeline.body_model
-    model_path = "scripts/gradio/static/assets/dump_wooden"
-    model = WoodenMesh(model_path)
+    model = WoodenMesh()  # Uses default path relative to this file
     params = {
         "rot6d": torch.randn(1, 52, 6),
         "trans": torch.randn(1, 3),

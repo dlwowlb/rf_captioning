@@ -92,8 +92,8 @@ def draw_skeleton(joints3D, kintree_table, ax=None, with_numbers=False):
 def draw_smpl_on_axis(pose,shape,translation=None, ax=None):
     pose = torch.tensor(pose).unsqueeze(0)
     shape = torch.tensor(shape).unsqueeze(0)
-    smpl_layer = SMPL_Layer(center_idx=0,gender='male',model_root='models/smpl_models')
-    verts, Jtr = smpl_layer(pose, th_betas=shape)
+    smpl_layer = SMPL_Layer(center_idx=0,gender='male',model_root='D:/ECCV/RF_Captioning/RF-Genesis/models/smpl_models')
+    verts, Jtr = smpl_layer(pose.float(), th_betas=shape.float())
 
     display_smpl(
         {'verts': verts.cpu().detach(),
@@ -152,8 +152,11 @@ def draw_combined(i,pointcloud_cfg,radar_frames,pointclouds,smpl_data):
 
     plt.tight_layout()
     fig.canvas.draw()
-    data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    #data = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    #data = data.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    data = np.asarray(fig.canvas.buffer_rgba())
+    data = data[:, :, :3] # RGBA(4채널) -> RGB(3채널)로 변환
+    
     plt.close(fig) 
     return data
 

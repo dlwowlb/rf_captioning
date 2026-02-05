@@ -56,11 +56,15 @@ def create_interpolator(_frames, _pointclouds, environment_pir, frame_rate=30, r
             
             t = (time * frame_rate) % 1 # fractional part of time
             frame1 = frames[frame_index]
-            frame2 = frames[frame_index + 1]
+            #frame2 = frames[frame_index + 1]
+
+            next_idx = min(frame_index + 1, len(frames) - 1)
+            frame2 = frames[next_idx]
+
 
             pointcloud1 = pointclouds[frame_index]
-            pointcloud2 = pointclouds[frame_index + 1]
-
+            #pointcloud2 = pointclouds[frame_index + 1]
+            pointcloud2 = pointclouds[next_idx]
 
 
             zero_depth_frame1 = frame1[:,:, 1] == 0  # zero depth pixels
