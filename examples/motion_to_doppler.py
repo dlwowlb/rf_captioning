@@ -150,95 +150,148 @@ def convert_hymotion_to_rfgenesis_format(
     Returns:
         Path to the saved .npz file
     """
+    from scipy.spatial.transform import Rotation as R
+
     # Extract SMPL parameters from model output
-    # HY-Motion output structure may vary, handle different cases
+    # HY-Motion returns: rot6d (B, L, J, 6), transl (B, L, 3)
 
     if isinstance(model_output, dict):
-        # Check for different possible keys
-        if 'smpl_params' in model_output:
-            smpl_data = model_output['smpl_params']
-        elif 'motion' in model_output:
-            smpl_data = model_output['motion']
-        elif 'output' in model_output:
-            smpl_data = model_output['output']
+        # HY-Motion returns rot6d and transl separately
+        if 'rot6d' in model_output and 'transl' in model_output:
+            rot6d = model_output['rot6d']
+            transl = model_output['transl']
+
+            if isinstance(rot6d, torch.Tensor):
+                rot6d = rot6d.cpu().numpy()
+            if isinstance(transl, torch.Tensor):
+                transl = transl.cpu().numpy()
+
+            # Remove batch dimension if present
+            if rot6d.ndim == 4:
+                rot6d = rot6d[0]  # (L, J, 6)
+            if transl.ndim == 3:
+                transl = transl[0]  # (L, 3)
+
+            num_frames = rot6d.shape[0]
+            num_joints = rot6d.shape[1]
+
+            print(f"[Convert] rot6d shape: {rot6d.shape}, transl shape: {transl.shape}")
+
+            # Convert rot6d to axis-angle using same method as RF-Genesis
+            # RF-Genesis uses: rot6d -> matrix -> euler (XYZ) -> axis-angle
+
+            def rot6d_to_matrix(rot_6d):
+                """Convert 6D rotation to 3x3 rotation matrix (same as PyTorch3D)."""
+                a1, a2 = rot_6d[..., :3], rot_6d[..., 3:6]
+                b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
+                b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+                b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
+                b3 = np.cross(b1, b2, axis=-1)
+                return np.stack([b1, b2, b3], axis=-1)  # (..., 3, 3)
+
+            def matrix_to_euler_xyz(rot_mat):
+                """Convert rotation matrix to Euler angles (XYZ order)."""
+                r = R.from_matrix(rot_mat)
+                return r.as_euler('xyz')
+
+            def euler_to_axis_angle(euler_xyz):
+                """Convert Euler angles (XYZ) to axis-angle."""
+                r = R.from_euler('xyz', euler_xyz)
+                return r.as_rotvec()
+
+            # Convert all rotations: rot6d -> matrix -> euler -> axis-angle
+            pose_params = np.zeros((num_frames, 72))  # 24 joints * 3
+
+            for frame_idx in range(num_frames):
+                for joint_idx in range(min(num_joints, 24)):
+                    rot_6d = rot6d[frame_idx, joint_idx]
+                    rot_mat = rot6d_to_matrix(rot_6d)
+                    euler = matrix_to_euler_xyz(rot_mat)
+                    axis_angle = euler_to_axis_angle(euler)
+                    pose_params[frame_idx, joint_idx*3:(joint_idx+1)*3] = axis_angle
+
+            # Apply coordinate transformation if needed
+            # HY-Motion: Y-up, Z-forward (looking at -Z)
+            # RF-Genesis: Y-up, Z-forward (sensor at origin looking at -Z, body at Z=3)
+            #
+            # The body in RF-Genesis is placed at position - body_offset where body_offset = [0, 1, 3]
+            # So if root_translation is [0, 0, 0], body is at [0, -1, -3]
+            # Sensor looks from [0,0,0] toward [0,0,-5]
+
+            root_translation = transl.copy()
+
+            # Scale translation if needed (HY-Motion might use different scale)
+            # RF-Genesis expects meters, adjust if HY-Motion uses different units
+
+            print(f"[Convert] Translation range: X[{root_translation[:,0].min():.3f}, {root_translation[:,0].max():.3f}], "
+                  f"Y[{root_translation[:,1].min():.3f}, {root_translation[:,1].max():.3f}], "
+                  f"Z[{root_translation[:,2].min():.3f}, {root_translation[:,2].max():.3f}]")
+
         else:
-            # Try to find numpy array in the dict
-            for key, value in model_output.items():
-                if isinstance(value, (np.ndarray, torch.Tensor)):
-                    smpl_data = value
-                    break
+            # Fallback: try to find motion data in latent_denorm format
+            if 'latent_denorm' in model_output:
+                smpl_data = model_output['latent_denorm']
+            elif 'motion' in model_output:
+                smpl_data = model_output['motion']
             else:
-                raise ValueError(f"Cannot find motion data in output. Keys: {model_output.keys()}")
+                for key, value in model_output.items():
+                    if isinstance(value, (np.ndarray, torch.Tensor)):
+                        smpl_data = value
+                        break
+                else:
+                    raise ValueError(f"Cannot find motion data. Keys: {model_output.keys()}")
+
+            if isinstance(smpl_data, torch.Tensor):
+                smpl_data = smpl_data.cpu().numpy()
+            if smpl_data.ndim == 3:
+                smpl_data = smpl_data[0]
+
+            num_frames = smpl_data.shape[0]
+            print(f"[Convert] SMPL data shape: {smpl_data.shape}")
+
+            # Parse 201D format: [trans(3), root_rot6d(6), body_rot6d(21*6=126), ...]
+            root_translation = smpl_data[:, :3].copy()
+
+            if smpl_data.shape[1] >= 135:
+                rot6d_flat = smpl_data[:, 3:135]  # (L, 132) = 22 joints * 6
+                rot6d = rot6d_flat.reshape(num_frames, 22, 6)
+
+                def rot6d_to_matrix(rot_6d):
+                    a1, a2 = rot_6d[..., :3], rot_6d[..., 3:6]
+                    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
+                    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
+                    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
+                    b3 = np.cross(b1, b2, axis=-1)
+                    return np.stack([b1, b2, b3], axis=-1)
+
+                pose_params = np.zeros((num_frames, 72))
+
+                for frame_idx in range(num_frames):
+                    for joint_idx in range(22):
+                        rot_6d = rot6d[frame_idx, joint_idx]
+                        rot_mat = rot6d_to_matrix(rot_6d)
+                        r = R.from_matrix(rot_mat)
+                        euler = r.as_euler('xyz')
+                        axis_angle = R.from_euler('xyz', euler).as_rotvec()
+                        pose_params[frame_idx, joint_idx*3:(joint_idx+1)*3] = axis_angle
+            else:
+                pose_params = smpl_data[:, 3:75] if smpl_data.shape[1] >= 75 else np.zeros((num_frames, 72))
     else:
-        smpl_data = model_output
-
-    # Convert to numpy if tensor
-    if isinstance(smpl_data, torch.Tensor):
-        smpl_data = smpl_data.cpu().numpy()
-
-    # Ensure correct shape
-    if smpl_data.ndim == 3:
-        smpl_data = smpl_data[0]  # Remove batch dimension
-
-    print(f"[Convert] SMPL data shape: {smpl_data.shape}")
-
-    # Parse SMPL parameters (assuming 201D format from HY-Motion)
-    # Format: [translation(3), global_orient(6), body_pose(21*6=126), ...]
-    num_frames = smpl_data.shape[0]
-
-    if smpl_data.shape[1] >= 135:
-        # Standard HY-Motion 201D format
-        translation = smpl_data[:, :3]
-        global_orient_6d = smpl_data[:, 3:9]
-        body_pose_6d = smpl_data[:, 9:135]
-
-        # Convert 6D rotation to axis-angle for RF-Genesis
-        from scipy.spatial.transform import Rotation
-
-        def rot6d_to_axis_angle(rot_6d):
-            """Convert 6D rotation representation to axis-angle."""
-            a1, a2 = rot_6d[:3], rot_6d[3:6]
-            b1 = a1 / (np.linalg.norm(a1) + 1e-8)
-            b2 = a2 - np.dot(b1, a2) * b1
-            b2 = b2 / (np.linalg.norm(b2) + 1e-8)
-            b3 = np.cross(b1, b2)
-            rot_mat = np.stack([b1, b2, b3], axis=1)
-            r = Rotation.from_matrix(rot_mat)
-            return r.as_rotvec()
-
-        # Convert rotations
-        pose_params = np.zeros((num_frames, 72))  # 24 joints * 3 (axis-angle)
-
-        for frame_idx in range(num_frames):
-            # Global orientation (1 joint)
-            pose_params[frame_idx, :3] = rot6d_to_axis_angle(global_orient_6d[frame_idx])
-
-            # Body pose (21 joints for SMPL-H, we use 23 for compatibility)
-            for joint_idx in range(21):
-                start_6d = joint_idx * 6
-                start_aa = (joint_idx + 1) * 3
-                if start_6d + 6 <= body_pose_6d.shape[1]:
-                    pose_params[frame_idx, start_aa:start_aa+3] = rot6d_to_axis_angle(
-                        body_pose_6d[frame_idx, start_6d:start_6d+6]
-                    )
-    else:
-        # Assume already in axis-angle format
-        pose_params = smpl_data[:, 3:75] if smpl_data.shape[1] >= 75 else smpl_data
-        translation = smpl_data[:, :3] if smpl_data.shape[1] >= 3 else np.zeros((num_frames, 3))
+        raise ValueError(f"Expected dict output, got {type(model_output)}")
 
     # Save in RF-Genesis format
-    shape_params = np.zeros(10)  # Default shape parameters
+    shape_params = np.zeros(10)
 
     np.savez(
         output_path,
         pose=pose_params,
         shape=shape_params,
-        root_translation=translation,
-        gender="neutral"
+        root_translation=root_translation,
+        gender="male"
     )
 
     print(f"[Convert] Saved to {output_path}")
-    print(f"[Convert] Pose shape: {pose_params.shape}, Translation shape: {translation.shape}")
+    print(f"[Convert] Pose shape: {pose_params.shape}, Translation shape: {root_translation.shape}")
 
     return output_path
 
