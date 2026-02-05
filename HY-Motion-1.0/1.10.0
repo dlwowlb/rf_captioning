@@ -1,0 +1,16 @@
+Collecting numpy<2.0,>=1.24.0
+  Using cached numpy-1.26.4-cp310-cp310-win_amd64.whl.metadata (61 kB)
+Collecting scipy
+  Using cached scipy-1.15.3-cp310-cp310-win_amd64.whl.metadata (60 kB)
+Collecting transforms3d==0.4.2
+  Using cached transforms3d-0.4.2-py3-none-any.whl.metadata (2.8 kB)
+Using cached transforms3d-0.4.2-py3-none-any.whl (1.4 MB)
+Using cached numpy-1.26.4-cp310-cp310-win_amd64.whl (15.8 MB)
+Using cached scipy-1.15.3-cp310-cp310-win_amd64.whl (41.3 MB)
+Installing collected packages: numpy, transforms3d, scipy
+  Attempting uninstall: numpy
+    Found existing installation: numpy 2.0.1
+    Uninstalling numpy-2.0.1:
+      Successfully uninstalled numpy-2.0.1
+
+Successfully installed numpy-1.26.4 scipy-1.15.3 transforms3d-0.4.2
