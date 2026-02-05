@@ -266,8 +266,13 @@ def run_rf_simulation(
     from genesis.raytracing import pathtracer, signal_generator
     from genesis.visualization import visualize
 
+    # Convert all paths to absolute to avoid issues with os.chdir()
+    motion_npz_path = os.path.abspath(motion_npz_path)
+    output_dir = os.path.abspath(output_dir)
+
     if radar_config_path is None:
         radar_config_path = str(RF_GENESIS_DIR / "models" / "TI1843_config.json")
+    radar_config_path = os.path.abspath(radar_config_path)
 
     print(f"[RF-Genesis] Starting simulation")
     print(f"[RF-Genesis] Motion file: {motion_npz_path}")
@@ -277,13 +282,13 @@ def run_rf_simulation(
     print("[RF-Genesis] Step 1/3: Ray tracing body PIRs...")
 
     # RF-Genesis pathtracer expects to run from genesis/ directory
+    # (because it loads ../models/male.ply with relative path)
     original_dir = os.getcwd()
     os.chdir(str(RF_GENESIS_DIR / "genesis"))
 
     try:
-        # Adjust path for relative access from genesis/
-        relative_npz = os.path.relpath(motion_npz_path, RF_GENESIS_DIR / "genesis")
-        body_pir, body_aux = pathtracer.trace(relative_npz)
+        # Use absolute path - no need for relpath conversion
+        body_pir, body_aux = pathtracer.trace(motion_npz_path)
     finally:
         os.chdir(original_dir)
 
