@@ -497,25 +497,21 @@ def generate_doppler_visualization(
     rd_maps = []
  
     for i in range(num_frames):
-        frame = radar_frames[i]
- 
-        # If complex, take magnitude
-        if np.iscomplexobj(frame):
-            frame = np.abs(frame)
- 
-        # Simple Range-Doppler processing
-        if frame.ndim >= 2:
-            # Apply 2D FFT if needed
-            if frame.shape[-1] > 1 and frame.shape[-2] > 1:
-                rd = np.fft.fftshift(np.fft.fft2(frame))
-                rd = 20 * np.log10(np.abs(rd) + 1e-12)
-            else:
-                rd = 20 * np.log10(frame + 1e-12)
+        frame = radar_frames[i]  # (num_tx, num_rx, chirp_per_frame, adc_samples), complex
+
+        # Correct FMCW processing: FFT on complex signal, THEN take magnitude.
+        # Doppler info is in inter-chirp phase; taking abs() before FFT destroys it.
+        if frame.ndim >= 2 and frame.shape[-1] > 1 and frame.shape[-2] > 1:
+            # Range FFT along ADC samples (last axis), keep complex
+            range_fft = np.fft.fft(frame, axis=-1)
+            # Doppler FFT along chirps (second-to-last axis) + fftshift
+            rd = np.fft.fftshift(np.fft.fft(range_fft, axis=-2), axes=-2)
+            rd = 20 * np.log10(np.abs(rd) + 1e-12)
         else:
-            rd = frame
- 
+            rd = 20 * np.log10(np.abs(frame) + 1e-12)
+
         if rd.ndim > 2:
-            # (3, 4, 128, 256) -> (128, 256)으로 평균내기
+            # (num_tx, num_rx, chirp_per_frame, adc_samples) -> (chirp_per_frame, adc_samples)
             dims_to_reduce = tuple(range(rd.ndim - 2))
             rd = np.mean(rd, axis=dims_to_reduce)
 
