@@ -63,7 +63,25 @@ def run_pipeline(obj_prompt, env_prompt=None, name=None, skip_visualize=False,
     
     os.chdir("genesis/")
     print(colored('[RFGen] Step 2/4: Rendering the human body PIRs: ', 'green'))
-    body_pir, body_aux = pathtracer.trace(os.path.join("../",output_dir, 'obj_diff.npz'))
+    
+    motion_path = os.path.join("../", output_dir, 'obj_diff.npz')
+    body_pir, body_aux = pathtracer.trace(motion_path)
+ 
+    # Read back sensor position computed by pathtracer.trace()
+    smpl_data = np.load(motion_path, allow_pickle=True)
+    root_translation = smpl_data['root_translation']
+    traj_center = root_translation.mean(axis=0)
+    sensor_origin = [
+        float(traj_center[0]),
+        float(traj_center[1] + 1.0),
+        float(traj_center[2] + 3.0),
+    ]
+    sensor_target = [
+        float(traj_center[0]),
+        float(traj_center[1] + 1.0),
+        float(traj_center[2]),
+    ]
+
     os.chdir("..")
     
 
@@ -77,7 +95,11 @@ def run_pipeline(obj_prompt, env_prompt=None, name=None, skip_visualize=False,
 
 
     print(colored('[RFGen] Step 4/4: Generating the radar signal.', 'green'))
-    radar_frames = signal_generator.generate_signal_frames(body_pir, body_aux, env_pir, radar_config="models/TI1843_config.json")
+    
+    radar_frames = signal_generator.generate_signal_frames(
+        body_pir, body_aux, env_pir, radar_config="models/TI1843_config.json",
+        sensor_origin=sensor_origin, sensor_target=sensor_target,
+    )
 
     print(colored('[RFGen] Saving the radar bin file. Shape {}'.format(radar_frames.shape), 'green'))
     np.save(os.path.join(output_dir, 'radar_frames.npy'), radar_frames)

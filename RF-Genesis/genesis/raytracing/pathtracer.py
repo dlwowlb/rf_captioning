@@ -170,6 +170,7 @@ def trace(motion_filename):
         float(traj_center[1] + 1.0),         # y: pelvis 높이
         float(traj_center[2] + sensor_distance),  # z: body 앞 3m
     )
+    
     sensor_target = (
         float(traj_center[0]),
         float(traj_center[1] + 1.0),
