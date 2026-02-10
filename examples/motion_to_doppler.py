@@ -131,7 +131,110 @@ def generate_motion_hymotion(
     print(f"[HY-Motion] Motion generated successfully!")
  
     return model_output
+
+# ============================================================================
+# SMPL-H to SMPL-24 Conversion Utilities
+# ============================================================================
+#
+# SMPL-H has 52 joints: 22 body + 30 hand finger joints.
+# Standard SMPL has 24 joints: 22 body + L_Hand (joint 22) + R_Hand (joint 23).
+#
+# BUG (fixed): Naively taking the first 72 values (24*3) from 156D SMPL-H
+# axis-angle causes indices 66-71 to contain L_Index1/L_Index2/L_Index3
+# (finger rotations) instead of L_Hand/R_Hand (hand root rotations).
+# SMPL_Layer interprets these as hand root joints, distorting body pose.
+#
+# FIX: Extract only 22 body joints, then append identity rotations for
+# L_Hand and R_Hand to produce correct 24-joint (72D) SMPL format.
+# ============================================================================
  
+ 
+def _rot6d_to_rotation_matrix_np(rot6d):
+    """Convert 6D rotation representation to rotation matrix (numpy).
+ 
+    Uses Gram-Schmidt orthogonalization (Zhou et al., CVPR 2019).
+ 
+    Args:
+        rot6d: (..., 6) array of 6D rotation representations
+ 
+    Returns:
+        (..., 3, 3) rotation matrices
+    """
+    x = rot6d.reshape(*rot6d.shape[:-1], 3, 2)
+    a1 = x[..., 0]
+    a2 = x[..., 1]
+    b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
+    dot = np.sum(b1 * a2, axis=-1, keepdims=True)
+    b2 = a2 - dot * b1
+    b2 = b2 / (np.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
+    b3 = np.cross(b1, b2, axis=-1)
+    return np.stack([b1, b2, b3], axis=-1)
+ 
+ 
+def _rotation_matrix_to_axis_angle_np(rot_mat):
+    """Convert rotation matrix to axis-angle (numpy, via scipy).
+ 
+    Args:
+        rot_mat: (..., 3, 3) rotation matrices
+ 
+    Returns:
+        (..., 3) axis-angle vectors
+    """
+    from scipy.spatial.transform import Rotation
+    orig_shape = rot_mat.shape[:-2]
+    flat = rot_mat.reshape(-1, 3, 3)
+    r = Rotation.from_matrix(flat)
+    aa = r.as_rotvec()
+    return aa.reshape(*orig_shape, 3)
+ 
+ 
+def _convert_rot6d_to_smpl24_pose(rot6d, transl):
+    """Convert SMPL-H rot6d to standard SMPL 24-joint axis-angle.
+ 
+    Takes only 22 body joints from SMPL-H and appends identity rotations
+    for L_Hand/R_Hand to create proper 24-joint SMPL format.
+ 
+    Args:
+        rot6d: (num_frames, num_joints, 6) or (B, num_frames, num_joints, 6)
+        transl: (num_frames, 3) or (B, num_frames, 3)
+ 
+    Returns:
+        pose_params: (num_frames, 72) - SMPL 24-joint axis-angle
+        translation: (num_frames, 3)
+    """
+    if isinstance(rot6d, torch.Tensor):
+        rot6d = rot6d.cpu().numpy()
+    if isinstance(transl, torch.Tensor):
+        transl = transl.cpu().numpy()
+ 
+    if rot6d.ndim == 4:
+        rot6d = rot6d[0]
+    if transl.ndim == 3:
+        transl = transl[0]
+ 
+    num_frames = rot6d.shape[0]
+    num_input_joints = rot6d.shape[1]
+ 
+    # CRITICAL: Take only first 22 body joints, discard finger joints (22-51)
+    body_rot6d = rot6d[:, :22, :]  # (num_frames, 22, 6)
+ 
+    # Convert 6D -> rotation matrix -> axis-angle (vectorized, no per-frame loop)
+    rot_matrices = _rot6d_to_rotation_matrix_np(body_rot6d)  # (num_frames, 22, 3, 3)
+    body_aa = _rotation_matrix_to_axis_angle_np(rot_matrices)  # (num_frames, 22, 3)
+ 
+    # Identity rotation (zero axis-angle) for L_Hand (joint 22) and R_Hand (joint 23)
+    hand_aa = np.zeros((num_frames, 2, 3), dtype=body_aa.dtype)
+ 
+    # 22 body + 2 hand root = 24 SMPL joints
+    smpl_aa = np.concatenate([body_aa, hand_aa], axis=1)  # (num_frames, 24, 3)
+    pose_params = smpl_aa.reshape(num_frames, -1)  # (num_frames, 72)
+ 
+    print(f"[Convert] rot6d input: {num_input_joints} joints -> "
+          f"22 body + 2 identity hand = 24 SMPL joints (72D)")
+ 
+    return pose_params, transl
+ 
+
  
 def convert_hymotion_to_rfgenesis_format(
     model_output: dict,
@@ -150,82 +253,117 @@ def convert_hymotion_to_rfgenesis_format(
     Returns:
         Path to the saved .npz file
     """
-    # Extract SMPL parameters from model output
-    # HY-Motion output structure may vary, handle different cases
+    if isinstance(model_output, dict) and 'rot6d' in model_output and 'transl' in model_output:
+        # Preferred: HY-Motion returns rot6d (B, L, J, 6) and transl (B, L, 3)
+        rot6d = model_output['rot6d']
+        transl = model_output['transl']
  
-    if isinstance(model_output, dict):
-        # Check for different possible keys
-        if 'smpl_params' in model_output:
-            smpl_data = model_output['smpl_params']
-        elif 'motion' in model_output:
-            smpl_data = model_output['motion']
-        elif 'output' in model_output:
-            smpl_data = model_output['output']
-        else:
-            # Try to find numpy array in the dict
-            for key, value in model_output.items():
-                if isinstance(value, (np.ndarray, torch.Tensor)):
-                    smpl_data = value
-                    break
-            else:
-                raise ValueError(f"Cannot find motion data in output. Keys: {model_output.keys()}")
-    else:
-        smpl_data = model_output
+        print(f"[Convert] Using rot6d: {_shape_str(rot6d)}, transl: {_shape_str(transl)}")
+        pose_params, translation = _convert_rot6d_to_smpl24_pose(rot6d, transl)
  
-    # Convert to numpy if tensor
-    if isinstance(smpl_data, torch.Tensor):
-        smpl_data = smpl_data.cpu().numpy()
+    elif isinstance(model_output, dict) and 'latent_denorm' in model_output:
+        # Fallback: 201D latent [translation(3), global_orient_6d(6), body_pose_6d(21*6)]
+        smpl_data = model_output['latent_denorm']
+        if isinstance(smpl_data, torch.Tensor):
+            smpl_data = smpl_data.cpu().numpy()
+        if smpl_data.ndim == 3:
+            smpl_data = smpl_data[0]
  
-    # Ensure correct shape
-    if smpl_data.ndim == 3:
-        smpl_data = smpl_data[0]  # Remove batch dimension
+        print(f"[Convert] Using latent_denorm: {smpl_data.shape}")
  
-    print(f"[Convert] SMPL data shape: {smpl_data.shape}")
- 
-    # Parse SMPL parameters (assuming 201D format from HY-Motion)
-    # Format: [translation(3), global_orient(6), body_pose(21*6=126), ...]
-    num_frames = smpl_data.shape[0]
- 
-    if smpl_data.shape[1] >= 135:
-        # Standard HY-Motion 201D format
+        num_frames = smpl_data.shape[0]  
+
+
+
+
+
+
         translation = smpl_data[:, :3]
-        global_orient_6d = smpl_data[:, 3:9]
-        body_pose_6d = smpl_data[:, 9:135]
+        
+
+        global_orient_6d = smpl_data[:, 3:9].reshape(num_frames, 1, 6)
+        body_pose_6d = smpl_data[:, 9:135].reshape(num_frames, 21, 6)
  
-        # Convert 6D rotation to axis-angle for RF-Genesis
-        from scipy.spatial.transform import Rotation
+        # global orient (1) + 21 body joints = 22 body joints
+        all_rot6d = np.concatenate([global_orient_6d, body_pose_6d], axis=1)
  
-        def rot6d_to_axis_angle(rot_6d):
-            """Convert 6D rotation representation to axis-angle."""
-            a1, a2 = rot_6d[:3], rot_6d[3:6]
-            b1 = a1 / (np.linalg.norm(a1) + 1e-8)
-            b2 = a2 - np.dot(b1, a2) * b1
-            b2 = b2 / (np.linalg.norm(b2) + 1e-8)
-            b3 = np.cross(b1, b2)
-            rot_mat = np.stack([b1, b2, b3], axis=1)
-            r = Rotation.from_matrix(rot_mat)
-            return r.as_rotvec()
+        rot_matrices = _rot6d_to_rotation_matrix_np(all_rot6d)
+        body_aa = _rotation_matrix_to_axis_angle_np(rot_matrices)
  
-        # Convert rotations
-        pose_params = np.zeros((num_frames, 72))  # 24 joints * 3 (axis-angle)
+        # Add identity for L_Hand/R_Hand
+        hand_aa = np.zeros((num_frames, 2, 3), dtype=body_aa.dtype)
+        smpl_aa = np.concatenate([body_aa, hand_aa], axis=1)  # (N, 24, 3)
+        pose_params = smpl_aa.reshape(num_frames, -1)
  
-        for frame_idx in range(num_frames):
-            # Global orientation (1 joint)
-            pose_params[frame_idx, :3] = rot6d_to_axis_angle(global_orient_6d[frame_idx])
- 
-            # Body pose (21 joints for SMPL-H, we use 23 for compatibility)
-            for joint_idx in range(21):
-                start_6d = joint_idx * 6
-                start_aa = (joint_idx + 1) * 3
-                if start_6d + 6 <= body_pose_6d.shape[1]:
-                    pose_params[frame_idx, start_aa:start_aa+3] = rot6d_to_axis_angle(
-                        body_pose_6d[frame_idx, start_6d:start_6d+6]
-                    )
+        print(f"[Convert] Latent path: 22 body + 2 identity hand = 24 SMPL joints (72D)")
+
+
+
     else:
-        # Assume already in axis-angle format
-        pose_params = smpl_data[:, 3:75] if smpl_data.shape[1] >= 75 else smpl_data
-        translation = smpl_data[:, :3] if smpl_data.shape[1] >= 3 else np.zeros((num_frames, 3))
+        # Generic fallback
+        if isinstance(model_output, dict):
+            smpl_data = None
+            for key in ['smpl_params', 'motion', 'output']:
+                if key in model_output:
+                    smpl_data = model_output[key]
+                    break
+            if smpl_data is None:
+                for key, value in model_output.items():
+                    if isinstance(value, (np.ndarray, torch.Tensor)):
+                        smpl_data = value
+                        print(f"[Convert] Warning: using generic key '{key}'")
+                        break
+                else:
+                    raise ValueError(
+                        f"Cannot find motion data in output. Keys: {model_output.keys()}")
+        else:
+            smpl_data = model_output
  
+        if isinstance(smpl_data, torch.Tensor):
+            smpl_data = smpl_data.cpu().numpy()
+        if smpl_data.ndim == 3:
+            smpl_data = smpl_data[0]
+ 
+        print(f"[Convert] Fallback path, data shape: {smpl_data.shape}")
+        num_frames = smpl_data.shape[0]
+        num_values = smpl_data.shape[1]
+ 
+        if num_values >= 135:
+            # 201D latent or similar 6D-rotation format
+            translation = smpl_data[:, :3]
+            global_orient_6d = smpl_data[:, 3:9].reshape(num_frames, 1, 6)
+            body_pose_6d = smpl_data[:, 9:135].reshape(num_frames, 21, 6)
+ 
+            all_rot6d = np.concatenate([global_orient_6d, body_pose_6d], axis=1)
+            rot_matrices = _rot6d_to_rotation_matrix_np(all_rot6d)
+            body_aa = _rotation_matrix_to_axis_angle_np(rot_matrices)
+ 
+            hand_aa = np.zeros((num_frames, 2, 3), dtype=body_aa.dtype)
+            smpl_aa = np.concatenate([body_aa, hand_aa], axis=1)
+            pose_params = smpl_aa.reshape(num_frames, -1)
+        else:
+            # Pre-converted axis-angle format
+            # CRITICAL: Do NOT take first 72 values blindly from 156D SMPL-H data.
+            # Indices 66-71 would be finger joints, not L_Hand/R_Hand.
+            # Instead: take 22 body joints (indices 0-65) + add 2 identity hand joints.
+            translation = smpl_data[:, :3] if num_values >= 3 else np.zeros((num_frames, 3))
+ 
+            if num_values >= 69:
+                # translation(3) + 22 body joints(66) = 69 values minimum
+                body_aa = smpl_data[:, 3:69].reshape(num_frames, 22, 3)
+            elif num_values >= 66:
+                body_aa = smpl_data[:, :66].reshape(num_frames, 22, 3)
+            else:
+                n_joints = (num_values - 3) // 3 if num_values > 3 else num_values // 3
+                body_aa = smpl_data[:, 3:3 + n_joints * 3].reshape(num_frames, n_joints, 3)
+                if n_joints < 22:
+                    pad = np.zeros((num_frames, 22 - n_joints, 3), dtype=body_aa.dtype)
+                    body_aa = np.concatenate([body_aa, pad], axis=1)
+ 
+            # Append identity for L_Hand/R_Hand (NEVER use 156D indices 66-71)
+            hand_aa = np.zeros((num_frames, 2, 3), dtype=body_aa.dtype)
+            smpl_aa = np.concatenate([body_aa, hand_aa], axis=1)
+            pose_params = smpl_aa.reshape(num_frames, -1)
     # Save in RF-Genesis format
     shape_params = np.zeros(10)  # Default shape parameters
  
@@ -241,6 +379,15 @@ def convert_hymotion_to_rfgenesis_format(
     print(f"[Convert] Pose shape: {pose_params.shape}, Translation shape: {translation.shape}")
  
     return output_path
+ 
+
+def _shape_str(x):
+    """Helper to get shape string from tensor or array."""
+    if isinstance(x, torch.Tensor):
+        return str(tuple(x.shape))
+    elif isinstance(x, np.ndarray):
+        return str(x.shape)
+    return str(type(x))
  
  
 def run_rf_simulation(
