@@ -157,16 +157,48 @@ def trace(motion_filename):
     sensor_origin = np.array([0,0,0])
     sensor_target = np.array([0,0,-5])
 
+    # Check for SMPL-H hand data
+    has_keypoints3d = 'keypoints3d' in smpl_data
+    has_pose_smplh = 'pose_smplh' in smpl_data
+
+    if has_keypoints3d:
+        keypoints3d = smpl_data['keypoints3d']  # (N, 52, 3)
+        num_hand_joints = keypoints3d.shape[1] - 22 if keypoints3d.shape[1] > 22 else 0
+        print(f"[PathTracer] Found keypoints3d with {keypoints3d.shape[1]} joints ({num_hand_joints} hand joints)")
+    elif has_pose_smplh:
+        print("[PathTracer] Found pose_smplh, will compute hand keypoints via FK")
+        from genesis.object_diffusion.object_diff import compute_hand_keypoints3d
+        keypoints3d = compute_hand_keypoints3d(
+            smpl_data['pose_smplh'],
+            smpl_data['root_translation'],
+        )
+        num_hand_joints = 30
+    else:
+        keypoints3d = None
+        num_hand_joints = 0
+
     raytracer = RayTracer()
     PIRs = []
     pointclouds = []
     total_motion_frames = len(root_translation)
 
     for frame_idx in tqdm(range(0, total_motion_frames), desc="Rendering Body PIRs"):
-        raytracer.update_pose(smpl_data['pose'][frame_idx], smpl_data['shape'][0], np.array(root_translation[frame_idx]) -  body_offset)
+        translation = np.array(root_translation[frame_idx]) - body_offset
+        raytracer.update_pose(smpl_data['pose'][frame_idx], smpl_data['shape'][0], translation)
         PIR, pc = raytracer.trace()
-        PIRs.append(torch.from_numpy(PIR).cuda())
-        pointclouds.append(torch.from_numpy(pc).cuda())
 
-    # pointclouds = torch.stack(pointclouds, dim=0)
+        # Append hand joint positions to point clouds if available
+        if keypoints3d is not None and keypoints3d.shape[1] > 22:
+            hand_joints = keypoints3d[frame_idx, 22:]  # (30, 3)
+            # Apply same body_offset transform as mesh vertices
+            hand_joints_shifted = hand_joints - body_offset
+            # Convert to same format as pc: each row is (x, y, z)
+            hand_pc = hand_joints_shifted.astype(np.float32)
+            pc_combined = np.concatenate([np.array(pc), hand_pc], axis=0)
+            pointclouds.append(torch.from_numpy(pc_combined).cuda())
+        else:
+            pointclouds.append(torch.from_numpy(np.array(pc)).cuda())
+
+        PIRs.append(torch.from_numpy(PIR).cuda())
+
     return PIRs, pointclouds
