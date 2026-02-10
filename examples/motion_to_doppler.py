@@ -397,75 +397,66 @@ def run_rf_simulation(
     skip_environment: bool = True,
     visualize_output: bool = True,
 ) -> np.ndarray:
-    """
-    Run RF-Genesis simulation on motion data.
- 
-    Args:
-        motion_npz_path: Path to SMPL parameters .npz file
-        output_dir: Output directory
-        radar_config_path: Path to radar config JSON
-        skip_environment: Whether to skip environment PIR generation
-        visualize_output: Whether to generate visualization video
- 
-    Returns:
-        Radar frames array
-    """
     from genesis.raytracing import pathtracer, signal_generator
     from genesis.visualization import visualize
- 
-    # Convert all paths to absolute to avoid issues with os.chdir()
+
     motion_npz_path = os.path.abspath(motion_npz_path)
     output_dir = os.path.abspath(output_dir)
- 
+
     if radar_config_path is None:
         radar_config_path = str(RF_GENESIS_DIR / "models" / "TI1843_config.json")
     radar_config_path = os.path.abspath(radar_config_path)
- 
+
     print(f"[RF-Genesis] Starting simulation")
-    print(f"[RF-Genesis] Motion file: {motion_npz_path}")
-    print(f"[RF-Genesis] Radar config: {radar_config_path}")
- 
-    # Step 1: Ray tracing to get body PIRs
+
+    # ── 수정: 센서 위치를 미리 계산 ──
+    smpl_data = np.load(motion_npz_path, allow_pickle=True)
+    root_translation = smpl_data['root_translation']
+    traj_center = root_translation.mean(axis=0)
+    sensor_distance = 3.0
+    sensor_origin = [
+        traj_center[0],
+        traj_center[1] + 1.0,
+        traj_center[2] + sensor_distance,
+    ]
+    sensor_target = [
+        traj_center[0],
+        traj_center[1] + 1.0,
+        traj_center[2],
+    ]
+    print(f"[RF-Genesis] Sensor origin={sensor_origin}, target={sensor_target}")
+
+    # Step 1: Ray tracing
     print("[RF-Genesis] Step 1/3: Ray tracing body PIRs...")
- 
-    # RF-Genesis pathtracer expects to run from genesis/ directory
-    # (because it loads ../models/male.ply with relative path)
     original_dir = os.getcwd()
     os.chdir(str(RF_GENESIS_DIR / "genesis"))
- 
     try:
-        # Use absolute path - no need for relpath conversion
         body_pir, body_aux = pathtracer.trace(motion_npz_path)
     finally:
         os.chdir(original_dir)
- 
-    print(f"[RF-Genesis] Body PIR frames: {len(body_pir)}")
- 
-    # Step 2: Generate radar signal frames
+
+    # Step 2: Signal generation (with coordinate transform)
     print("[RF-Genesis] Step 2/3: Generating radar signal frames...")
- 
-    # Environment PIR is optional
     env_pir = None
- 
+
     radar_frames = signal_generator.generate_signal_frames(
         body_pir,
         body_aux,
         env_pir,
-        radar_config=radar_config_path
+        radar_config=radar_config_path,
+        sensor_origin=sensor_origin,      # ← 추가
+        sensor_target=sensor_target,      # ← 추가
     )
- 
+
     print(f"[RF-Genesis] Radar frames shape: {radar_frames.shape}")
- 
-    # Save radar frames
+
     radar_output_path = os.path.join(output_dir, "radar_frames.npy")
     np.save(radar_output_path, radar_frames)
-    print(f"[RF-Genesis] Saved radar frames to {radar_output_path}")
- 
+
     # Step 3: Visualization
     if visualize_output:
         print("[RF-Genesis] Step 3/3: Generating visualization...")
-        torch.set_default_device('cpu')  # Avoid OOM during visualization
- 
+        torch.set_default_device('cpu')
         video_path = os.path.join(output_dir, "output.mp4")
         visualize.save_video(
             radar_config_path,
@@ -474,7 +465,7 @@ def run_rf_simulation(
             video_path
         )
         print(f"[RF-Genesis] Saved video to {video_path}")
- 
+
     return radar_frames
  
  

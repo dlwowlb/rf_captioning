@@ -34,88 +34,126 @@ def calculate_environment_points(environment_pir):
     points = xyz.reshape(-1, 3)  # [H*W, 3]
     return points
 
-def create_interpolator(_frames, _pointclouds, environment_pir, frame_rate=30, remove_zeros = True):
-    num_frames = len(_frames)   
+
+def camera_to_world_points(points, sensor_origin, sensor_target):
+    """
+    카메라 좌표계의 pointcloud를 세계 좌표계로 변환.
+    Mitsuba의 look_at convention에 맞춰 변환 행렬을 구성한다.
+    
+    Args:
+        points: (N, 3) 카메라 좌표계의 점들
+        sensor_origin: [x, y, z] 세계좌표에서의 센서 위치
+        sensor_target: [x, y, z] 세계좌표에서의 센서가 바라보는 지점
+    Returns:
+        (N, 3) 세계 좌표계의 점들
+    """
+    origin = torch.tensor(sensor_origin, dtype=points.dtype, device=points.device)
+    target = torch.tensor(sensor_target, dtype=points.dtype, device=points.device)
+    up = torch.tensor([0.0, 1.0, 0.0], dtype=points.dtype, device=points.device)
+
+    # look_at 기저 벡터 (카메라 z축 = -forward)
+    forward = target - origin
+    forward = forward / forward.norm()
+    right = torch.cross(forward, up)
+    right = right / right.norm()
+    true_up = torch.cross(right, forward)
+
+    # 카메라→세계 회전 행렬 (카메라의 x,y,z 축이 세계좌표에서 어디를 가리키는지)
+    # Mitsuba convention: 카메라 -z 방향이 forward
+    R = torch.stack([right, true_up, -forward], dim=1)  # (3, 3)
+
+    # 변환: p_world = R @ p_cam + origin
+    world_points = (R @ points.T).T + origin.unsqueeze(0)
+    return world_points
+
+def create_interpolator(_frames, _pointclouds, environment_pir,
+                        frame_rate=30, remove_zeros=True,
+                        sensor_origin=None, sensor_target=None):
+    """
+    수정: sensor_origin/target을 받아서 pointcloud를 세계좌표로 변환
+    """
+    num_frames = len(_frames)
     total_time = num_frames / frame_rate
     frames = _frames.copy()
     pointclouds = _pointclouds.copy()
 
-    if environment_pir != None:
-        # redue the size of environment PIR to reduce the memory usages
+    # ── 핵심 수정: pointcloud를 세계좌표로 변환 ──
+    if sensor_origin is not None and sensor_target is not None:
+        for i in range(len(pointclouds)):
+            pointclouds[i] = camera_to_world_points(
+                pointclouds[i], sensor_origin, sensor_target
+            )
+
+    if environment_pir is not None:
         environment_pir = environment_pir.resize((64, 64), resample=Image.Resampling.BILINEAR)
-        environment_pir = torch.tensor(np.array(environment_pir),dtype=torch.float32)/255.0
+        environment_pir = torch.tensor(np.array(environment_pir), dtype=torch.float32) / 255.0
         environment_points = calculate_environment_points(environment_pir)
-        environment_intensity = environment_pir[:,:,1].flatten()
+        environment_intensity = environment_pir[:, :, 1].flatten()
+
     def interpolator(time):
-            if time < 0 or time > total_time:
-                raise ValueError("Invalid time value")
-            
-            frame_index = int(time * frame_rate)
-            if frame_index == num_frames:
-                return frames[-1]
-            
-            t = (time * frame_rate) % 1 # fractional part of time
-            frame1 = frames[frame_index]
-            #frame2 = frames[frame_index + 1]
+        if time < 0 or time > total_time:
+            raise ValueError("Invalid time value")
 
-            next_idx = min(frame_index + 1, len(frames) - 1)
-            frame2 = frames[next_idx]
+        frame_index = int(time * frame_rate)
+        if frame_index == num_frames:
+            return frames[-1]
 
+        t = (time * frame_rate) % 1
+        frame1 = frames[frame_index]
+        next_idx = min(frame_index + 1, len(frames) - 1)
+        frame2 = frames[next_idx]
 
-            pointcloud1 = pointclouds[frame_index]
-            #pointcloud2 = pointclouds[frame_index + 1]
-            pointcloud2 = pointclouds[next_idx]
+        pointcloud1 = pointclouds[frame_index]
+        pointcloud2 = pointclouds[next_idx]
 
+        zero_depth_frame1 = frame1[:, :, 1] == 0
+        zero_depth_frame2 = frame2[:, :, 1] == 0
+        zero_depth_frame1_flat = zero_depth_frame1.reshape(-1)
+        zero_depth_frame2_flat = zero_depth_frame2.reshape(-1)
 
-            zero_depth_frame1 = frame1[:,:, 1] == 0  # zero depth pixels
-            zero_depth_frame2 = frame2[:,:, 1] == 0
+        frame1[zero_depth_frame1] = frame2[zero_depth_frame1]
+        frame2[zero_depth_frame2] = frame1[zero_depth_frame2]
+        pointcloud1[zero_depth_frame1_flat] = pointcloud2[zero_depth_frame1_flat]
+        pointcloud2[zero_depth_frame2_flat] = pointcloud1[zero_depth_frame2_flat]
 
-            zero_depth_frame1_flat = zero_depth_frame1.reshape(-1)
-            zero_depth_frame2_flat = zero_depth_frame2.reshape(-1)
+        interpolated_frame = frame1 * (1 - t) + frame2 * t
+        interpolated_pointcloud = pointcloud1 * (1 - t) + pointcloud2 * t
 
+        flatten_pir = interpolated_frame.reshape(-1, 3)
+        intensity = flatten_pir[:, 0]
+        depth = flatten_pir[:, 1]
+        mask = (depth > 0.1) & (intensity > 0.1)
 
-            frame1[zero_depth_frame1] = frame2[zero_depth_frame1] # replace zero depth pixels with the other frame
-            frame2[zero_depth_frame2] = frame1[zero_depth_frame2]
+        if environment_pir is not None:
+            combined_intensity = torch.cat((environment_intensity, intensity[mask]), dim=0)
+            combined_pointcloud = torch.cat((environment_points, interpolated_pointcloud[mask]), dim=0)
+        else:
+            combined_intensity = intensity[mask]
+            combined_pointcloud = interpolated_pointcloud[mask]
 
-            pointcloud1[zero_depth_frame1_flat] = pointcloud2[zero_depth_frame1_flat] # replace zero depth pixels with the other frame
-            pointcloud2[zero_depth_frame2_flat] = pointcloud1[zero_depth_frame2_flat]
+        return combined_intensity, combined_pointcloud
 
-
-            interpolated_frame = frame1 * (1 - t) + frame2 * t
-            interpolated_pointcloud = pointcloud1 * (1 - t) + pointcloud2 * t
-
-            flatten_pir  = interpolated_frame.reshape(-1, 3)
-
-            intensity = flatten_pir[:,0]
-            depth = flatten_pir[:,1]
-            
-            mask = (depth > 0.1) & (intensity > 0.1)
-
-            if environment_pir != None:
-                combined_intensity = torch.cat((environment_intensity, intensity[mask]), dim=0)
-                combined_pointcloud = torch.cat((environment_points, interpolated_pointcloud[mask]), dim=0)
-            else:
-                combined_intensity = intensity[mask]
-                combined_pointcloud = interpolated_pointcloud[mask]
-            # return flatten_pir[:,1], interpolated_pointcloud[mask]
-            return combined_intensity, combined_pointcloud
-        
-    
     return interpolator
 
 
 
 
-def generate_signal_frames(body_pirs,body_auxs,envir_pir, radar_config):
-    interpolator = create_interpolator(body_pirs,body_auxs,envir_pir, frame_rate=30)
+def generate_signal_frames(body_pirs, body_auxs, envir_pir, radar_config,
+                           sensor_origin=None, sensor_target=None):
+    """수정: sensor 위치 정보를 interpolator에 전달"""
+    interpolator = create_interpolator(
+        body_pirs, body_auxs, envir_pir,
+        frame_rate=30,
+        sensor_origin=sensor_origin,
+        sensor_target=sensor_target,
+    )
     total_motion_frames = len(body_pirs)
-
     radar = Radar(radar_config)
 
     total_radar_frame = int(total_motion_frames / 30 * radar.frame_per_second)
     frames = []
     for i in tqdm(range(total_radar_frame), desc="Generating radar frames"):
-        frame_mimo = radar.frameMIMO(interpolator,i*1.0/radar.frame_per_second)
+        frame_mimo = radar.frameMIMO(interpolator, i * 1.0 / radar.frame_per_second)
         frames.append(frame_mimo.cpu().numpy())
     frames = np.array(frames)
     return frames

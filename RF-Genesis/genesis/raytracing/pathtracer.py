@@ -135,13 +135,13 @@ def get_deafult_scene(res = 512):
 
             'tx':{
                 'type': 'spot',
-                'cutoff_angle': 40,
+                'cutoff_angle': 60,
                 'to_world': T.look_at(
-                                origin=(0, 0, 3),
-                                target=(0, 0, 0),
+                                origin=(0, 1, 3),
+                                target=(0, 1, 0),
                                 up=(0, 1, 0)
                             ),
-                'intensity': 1000.0,
+                'intensity': 1500.0,
             }
 
         }
@@ -152,21 +152,49 @@ def get_deafult_scene(res = 512):
 def trace(motion_filename):
     smpl_data = np.load(motion_filename, allow_pickle=True)
     root_translation = smpl_data['root_translation']
-    max_distance = np.max(root_translation[:,2])+2
-    body_offset = np.array([0,1,3])
-    sensor_origin = np.array([0,0,0])
-    sensor_target = np.array([0,0,-5])
 
     raytracer = RayTracer()
+
+    # ── 핵심 수정 1: body_offset 제거, 센서를 body 기준으로 배치 ──
+    # HY-Motion의 root_translation은 이미 바닥 보정(min_y 제거)이 완료된 상태.
+    # body_offset을 빼면 바닥 아래로 빠지므로, translation을 그대로 사용한다.
+    # 대신 센서(카메라)를 body 앞에 적절히 배치한다.
+
+    # 전체 trajectory의 중심점 계산 (센서 위치 결정용)
+    traj_center = root_translation.mean(axis=0)  # (3,)
+    # SMPL 좌표계: x=좌우, y=위, z=앞뒤
+    # 센서를 body 정면 3m 앞, pelvis 높이(~1m)에 배치
+    sensor_distance = 3.0
+    sensor_origin = (
+        float(traj_center[0]),               # x: trajectory 중심
+        float(traj_center[1] + 1.0),         # y: pelvis 높이
+        float(traj_center[2] + sensor_distance),  # z: body 앞 3m
+    )
+    sensor_target = (
+        float(traj_center[0]),
+        float(traj_center[1] + 1.0),
+        float(traj_center[2]),
+    )
+
+    # ── 핵심 수정 2: 실제로 update_sensor() 호출 ──
+    raytracer.update_sensor(origin=sensor_origin, target=sensor_target)
+    print(f"[Trace] sensor origin={sensor_origin}, target={sensor_target}")
+    print(f"[Trace] trajectory center={traj_center}, "
+          f"y range=[{root_translation[:,1].min():.3f}, {root_translation[:,1].max():.3f}]")
+
     PIRs = []
     pointclouds = []
     total_motion_frames = len(root_translation)
 
     for frame_idx in tqdm(range(0, total_motion_frames), desc="Rendering Body PIRs"):
-        raytracer.update_pose(smpl_data['pose'][frame_idx], smpl_data['shape'][0], np.array(root_translation[frame_idx]) -  body_offset)
+        # ── 핵심 수정 3: body_offset 제거, translation 그대로 사용 ──
+        raytracer.update_pose(
+            smpl_data['pose'][frame_idx],
+            smpl_data['shape'],              # shape이 1D일 수도 있으므로
+            np.array(root_translation[frame_idx])  # offset 없이 그대로
+        )
         PIR, pc = raytracer.trace()
         PIRs.append(torch.from_numpy(PIR).cuda())
         pointclouds.append(torch.from_numpy(pc).cuda())
 
-    # pointclouds = torch.stack(pointclouds, dim=0)
     return PIRs, pointclouds

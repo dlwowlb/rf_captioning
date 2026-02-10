@@ -17,28 +17,16 @@ from smplpytorch.pytorch.smpl_layer import SMPL_Layer
 
 
 # SMPL 
-def display_smpl(
-        model_info,
-        model_faces=None,
-        with_joints=False,
-        kintree_table=None,
-        ax=None,
-        batch_idx=0,
-        translation=None,
-        ):
-    """
-    Displays mesh batch_idx in batch of model_info, model_info as returned by
-    generate_random_model
-    """
+def display_smpl(model_info, model_faces=None, with_joints=False,
+                 kintree_table=None, ax=None, batch_idx=0, translation=None):
     if ax is None:
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
-    verts, joints = model_info['verts'][batch_idx], model_info['joints'][
-        batch_idx]
+    verts, joints = model_info['verts'][batch_idx], model_info['joints'][batch_idx]
     if translation is not None:
         verts += translation
         joints += translation
-    
+
     if model_faces is None:
         ax.scatter(verts[:, 0], verts[:, 1], verts[:, 2], alpha=0.2)
     else:
@@ -50,16 +38,22 @@ def display_smpl(
         ax.add_collection3d(mesh)
     if with_joints:
         draw_skeleton(joints, kintree_table=kintree_table, ax=ax)
+
+    # ── 수정: vertex 기반 동적 범위 ──
+    margin = 0.5
+    verts_np = verts.cpu().numpy() if hasattr(verts, 'cpu') else np.array(verts)
+    center = verts_np.mean(axis=0)
+    extent = max(verts_np.max(axis=0) - verts_np.min(axis=0)) / 2 + margin
+
+    ax.set_xlim(center[0] - extent, center[0] + extent)
+    ax.set_ylim(center[1] - extent, center[1] + extent)
+    ax.set_zlim(center[2] - extent, center[2] + extent)
+
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
-    ax.set_xlim(-2, 2)
-    ax.set_ylim(-0.5, 2)
-    ax.set_zlim(-1, 3)
-    ax.view_init(azim=-90, elev=100)
-    ax.view_init(azim=30, elev=30, roll = 105)
+    ax.view_init(azim=30, elev=30, roll=105)
     ax.set_title('SMPL model', fontsize=20)
-    # fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
     return ax
 
 
@@ -104,19 +98,29 @@ def draw_smpl_on_axis(pose,shape,translation=None, ax=None):
     
 
 # Plotting Pointclouds
-def draw_poinclouds_on_axis(pc,ax, tx,rx,elev,azim,title):
+def draw_poinclouds_on_axis(pc, ax, tx, rx, elev, azim, title):
     pc = np.transpose(pc)
-    ax.scatter(-pc[0], pc[1], pc[2], c=pc[4], cmap=plt.hot())
+    if pc.shape[1] == 0:
+        ax.set_title(title + " (no points)")
+        return
+
+    # ── 수정: X축 반전 제거, 동적 범위 ──
+    ax.scatter(pc[0], pc[1], pc[2], c=pc[4], cmap=plt.hot())
     if tx is not None:
-        ax.scatter(tx[:,0], tx[:,2], tx[:,1], c="green", s= 50, marker =',', cmap=plt.hot())
+        ax.scatter(tx[:, 0], tx[:, 1], tx[:, 2], c="green", s=50, marker=',')
     if rx is not None:
-        ax.scatter(rx[:,0], rx[:,2], rx[:,1], c="orange", s= 50, marker =',', cmap=plt.hot())
-    ax.set_xlim(-2, 2)
-    ax.set_ylim(-0, 6)
-    ax.set_zlim(-0.5, 2)
+        ax.scatter(rx[:, 0], rx[:, 1], rx[:, 2], c="orange", s=50, marker=',')
+
+    margin = 0.5
+    for dim, label in enumerate(['X', 'Y', 'Z']):
+        lo, hi = pc[dim].min() - margin, pc[dim].max() + margin
+        if dim == 0: ax.set_xlim(lo, hi)
+        elif dim == 1: ax.set_ylim(lo, hi)
+        else: ax.set_zlim(lo, hi)
+
     ax.set_xlabel('X')
-    ax.set_ylabel('Z')
-    ax.set_zlabel('Y')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
     ax.view_init(elev=elev, azim=azim)
     ax.set_title(title, fontsize=20)
 
