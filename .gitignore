@@ -2,11 +2,15 @@
 !.gitignore
 
 # HY-Motion 설정
-!/HY-Motion-1.0/           # 폴더 자체를 허용
-/HY-Motion-1.0/* # 폴더 내부는 다시 무시
-!/HY-Motion-1.0/hymotion/  # 원하는 폴더만 다시 허용
+!/HY-Motion-1.0/
+/HY-Motion-1.0/*
+!/HY-Motion-1.0/hymotion/
 
 # RF-Genesis 설정
-!/RF-Genesis/              # 폴더 자체를 허용
-/RF-Genesis/* # 폴더 내부는 다시 무시
-!/RF-Genesis/genesiss/     # 원하는 폴더만 다시 허용
+!/RF-Genesis/
+/RF-Genesis/*
+!/RF-Genesis/genesis/
+!/RF-Genesis/run.py
+
+!/examples/
+

@@ -339,60 +339,110 @@ def construct_smpl_data_dict(
     betas: Optional[Tensor] = None,
     gender: str = "neutral",
     use_default_hand_mean_pose: bool = False,
+    output_format: str = "smplh",
 ) -> dict:
+    
+    """Construct SMPL data dictionary from rot6d and translation.
+ 
+    Args:
+        rot6d: (num_frames, num_joints, 6) - rotation in 6D representation
+        transl: (num_frames, 3) - root translation
+        betas: optional shape parameters
+        gender: body model gender
+        use_default_hand_mean_pose: whether to use default hand poses for SMPL-H
+        output_format: "smplh" for 52-joint SMPL-H (156D), "smpl24" for 24-joint standard SMPL (72D)
+ 
+    Returns:
+        dict with poses, trans, betas, gender, etc.
+    """
+
+
     rotation_matrix = rot6d_to_rotation_matrix(rot6d)
     angle_axis = rotation_matrix_to_angle_axis(rotation_matrix)
-    left_hand_mean_pose = (
-        torch.tensor(
-            LEFT_HAND_MEAN_AA,
-            device=angle_axis.device,
-            dtype=angle_axis.dtype,
+    
+
+
+    if output_format == "smpl24":
+        # Standard SMPL 24-joint format: 22 body joints + 2 hand root joints (identity)
+        body_aa = angle_axis[:, :22, :]  # (N, 22, 3)
+        hand_aa = torch.zeros(
+            angle_axis.shape[0], 2, 3,
+            dtype=angle_axis.dtype, device=angle_axis.device,
+            
         )
-        .unsqueeze(0)
-        .repeat(angle_axis.shape[0], 1)
-        .reshape(angle_axis.shape[0], -1, 3)
-    )
-    right_hand_mean_pose = (
-        torch.tensor(
-            RIGHT_HAND_MEAN_AA,
-            device=angle_axis.device,
-            dtype=angle_axis.dtype,
+        
+
+        angle_axis_out = torch.cat([body_aa, hand_aa], dim=1)  # (N, 24, 3)
+        expected_joints = 24
+    else:
+        # SMPL-H 52-joint format (original behavior)
+        left_hand_mean_pose = (
+            torch.tensor(
+                LEFT_HAND_MEAN_AA,
+                device=angle_axis.device,
+                dtype=angle_axis.dtype,
+            )
+            .unsqueeze(0)
+            .repeat(angle_axis.shape[0], 1)
+            .reshape(angle_axis.shape[0], -1, 3)
+
         )
-        .unsqueeze(0)
-        .repeat(angle_axis.shape[0], 1)
-        .reshape(angle_axis.shape[0], -1, 3)
-    )
-    if angle_axis.shape[1] == 22:
-        angle_axis = torch.cat(
-            [
-                angle_axis,
-                left_hand_mean_pose,
-                right_hand_mean_pose,
-            ],
-            dim=1,
+        
+        right_hand_mean_pose = (
+            torch.tensor(
+                RIGHT_HAND_MEAN_AA,
+                device=angle_axis.device,
+                dtype=angle_axis.dtype,
+            )
+            .unsqueeze(0)
+            .repeat(angle_axis.shape[0], 1)
+            .reshape(angle_axis.shape[0], -1, 3)
+
         )
-    elif angle_axis.shape[1] == 52:
-        if use_default_hand_mean_pose:
-            angle_axis = torch.cat(
+    
+
+        if angle_axis.shape[1] == 22:
+            angle_axis_out = torch.cat(
+
                 [
-                    angle_axis[:, :22],
+                    angle_axis,
                     left_hand_mean_pose,
                     right_hand_mean_pose,
                 ],
                 dim=1,
             )
-        else:
-            angle_axis = angle_axis
 
-    assert angle_axis.shape[1] == 52, f"angle_axis should be 52, but got {angle_axis.shape[1]}"
+        elif angle_axis.shape[1] == 52:
+            if use_default_hand_mean_pose:
+                angle_axis_out = torch.cat(
+                    [
+                        angle_axis[:, :22],
+                        left_hand_mean_pose,
+                        right_hand_mean_pose,
+                    ],
+                    dim=1,
+                )
+            else:
+                angle_axis_out = angle_axis
+
+
+        else:
+            angle_axis_out = angle_axis
+        expected_joints = 52
+
+    
+    assert angle_axis_out.shape[1] == expected_joints, (
+        f"angle_axis should be {expected_joints}, but got {angle_axis_out.shape[1]}"
+    )
+    
     dump = {
         "betas": betas.cpu().numpy() if betas is not None else np.zeros((1, 16)),
         "gender": gender,
-        "poses": angle_axis.cpu().numpy().reshape(angle_axis.shape[0], -1),
+        "poses": angle_axis_out.cpu().numpy().reshape(angle_axis_out.shape[0], -1),
         "trans": transl.cpu().numpy(),
         "mocap_framerate": 30,
-        "num_frames": angle_axis.shape[0],
-        "Rh": angle_axis.cpu().numpy().reshape(angle_axis.shape[0], -1)[:, :3],
+        "num_frames": angle_axis_out.shape[0],
+        "Rh": angle_axis_out.cpu().numpy().reshape(angle_axis_out.shape[0], -1)[:, :3],
     }
     return dump
 

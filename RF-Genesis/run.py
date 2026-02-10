@@ -31,10 +31,20 @@ def get_args():
     return args.obj_prompt, args.env_prompt, args.name, args.skip_visualize, args.skip_environment
 
 
-def main():
-    obj_prompt, env_prompt, name, skip_visualize, skip_environment = get_args()
-    # obj_prompt, env_prompt, name = "a person walking back and forth", "", "test"
 
+def run_pipeline(obj_prompt, env_prompt=None, name=None, skip_visualize=False,
+                 skip_environment=False, hymotion_output=None):
+    """Run the RF-Genesis pipeline.
+ 
+    Args:
+        obj_prompt: text prompt for motion generation
+        env_prompt: text prompt for environment generation
+        name: output directory name
+        skip_visualize: whether to skip visualization
+        skip_environment: whether to skip environment generation
+        hymotion_output: pre-generated HY-Motion output dict with 'rot6d' and 'transl' keys.
+                         When provided, uses HY-Motion instead of MDM for motion generation.
+    """
     
 
     if name is None:
@@ -46,7 +56,7 @@ def main():
 
     if not os.path.exists(os.path.join(output_dir, 'obj_diff.npz')):
         print(colored('[RFGen] Step 1/4: Generating the human body motion: ', 'green'))
-        object_diff.generate(obj_prompt, output_dir)
+        object_diff.generate(obj_prompt, output_dir, hymotion_output=hymotion_output)
     else:
         print(colored('[RFGen] Step 1/4: Already done, existing body motion file, skiping this step.', 'green'))
 
@@ -56,12 +66,6 @@ def main():
     body_pir, body_aux = pathtracer.trace(os.path.join("../",output_dir, 'obj_diff.npz'))
     os.chdir("..")
     
-    
-    # print(colored('[RFGen] Step 3/4: Generating the environmental PIRs: ', 'green'))
-    # print(colored('[RFGen] Step 3/4: [Jan 2024] RFLoRA and Environment Diffusion is Temporarily Disabled.', 'red'))ç
-    # print(colored('                  We will update tuned RFLoRA soon.', 'red'))
-    # print(colored('                  RFGen will continue without RFLoRA.', 'green'))
-
 
     if not skip_environment:
         print(colored('[RFGen] Step 3/4: Generating the environmental PIRs: ', 'green'))
@@ -82,9 +86,9 @@ def main():
         print(colored('[RFGen] Rendering the visualization.', 'green'))
         torch.set_default_device('cpu')  # To avoid OOM
         visualize.save_video(
-            "models/TI1843_config.json", 
-            os.path.join(output_dir, 'radar_frames.npy'), 
-            os.path.join(output_dir, 'obj_diff.npz'), 
+            "models/TI1843_config.json",
+            os.path.join(output_dir, 'radar_frames.npy'),
+            os.path.join(output_dir, 'obj_diff.npz'),
             os.path.join(output_dir, 'output.mp4'))
     else:
         print(colored('[RFGen] Skipping visualization step.', 'yellow'))
@@ -94,6 +98,14 @@ def main():
     print(colored('[RFGen] Hooray! you are all set! ', 'green')) 
     print(colored('----------------------------------------', 'green')) 
     print(colored('        Please ignore the segmentation faults if there are any.', 'green'))
+
+
+    return output_dir
+ 
+ 
+def main():
+    obj_prompt, env_prompt, name, skip_visualize, skip_environment = get_args()
+    run_pipeline(obj_prompt, env_prompt, name, skip_visualize, skip_environment)
 
     exit(0)
 if __name__ == '__main__':
