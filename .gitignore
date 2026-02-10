@@ -11,3 +11,7 @@
 /RF-Genesis/*
 !/RF-Genesis/genesis/
 !/RF-Genesis/run.py
+
+# Examples
+!/examples/
+/examples/__pycache__/
