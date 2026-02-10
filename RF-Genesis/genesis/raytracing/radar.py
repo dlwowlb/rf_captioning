@@ -81,33 +81,47 @@ class Radar:
         sig = dechirp(rx_combined,tx)
         return sig
     
-    def frame(self,interpolator,t0, n_ray = 1):
+    def frame(self,interpolator,t0, n_ray = 1, sensor_origin=None):
         frame = torch.zeros((self.chirp_per_frame, self.adc_samples),dtype = torch.complex128)
+
+        # Offset antenna positions to sensor location in world coordinates
+        origin_offset = torch.zeros(3, dtype=self.tx_pos.dtype, device=self.tx_pos.device)
+        if sensor_origin is not None:
+            origin_offset = torch.tensor(sensor_origin, dtype=self.tx_pos.dtype, device=self.tx_pos.device)
+
         for chirp_id in range(self.chirp_per_frame):
             time_in_frame = chirp_id / self.chirp_per_frame / self.frame_per_second
             intensity,loc =  interpolator(t0+time_in_frame)
-            tx_pos = self.tx_pos[0].unsqueeze(0)  # Convert shape from (3,) to (1, 3)
-            rx_pos = self.rx_pos[0].unsqueeze(0)  # Convert shape from (3,) to (1, 3)
-            tof = torch.cdist(loc,tx_pos)+ torch.cdist(loc,rx_pos) 
+            tx_pos = self.tx_pos[0].unsqueeze(0) + origin_offset.unsqueeze(0)
+            rx_pos = self.rx_pos[0].unsqueeze(0) + origin_offset.unsqueeze(0)
+            tof = torch.cdist(loc,tx_pos)+ torch.cdist(loc,rx_pos)
 
             chirp =  self.chirp(tof,intensity)
             frame[chirp_id,:] =chirp
         return frame
     
 
-    def frameMIMO(self,interpolator,t0=0, n_ray = 1):
+    def frameMIMO(self,interpolator,t0=0, n_ray = 1, sensor_origin=None):
         frame = torch.zeros((self.num_tx, self.num_rx, self.chirp_per_frame, self.adc_samples),dtype = torch.complex128)
-        for chirp_id in range(self.chirp_per_frame): 
-            
+
+        # Offset antenna positions to sensor location in world coordinates.
+        # tx_pos/rx_pos are mm-scale offsets around (0,0,0); sensor_origin is
+        # the world-coordinate position where the radar physically sits.
+        origin_offset = torch.zeros(3, dtype=self.tx_pos.dtype, device=self.tx_pos.device)
+        if sensor_origin is not None:
+            origin_offset = torch.tensor(sensor_origin, dtype=self.tx_pos.dtype, device=self.tx_pos.device)
+
+        for chirp_id in range(self.chirp_per_frame):
+
             # it is inefficient to calculate the location for every sample point, so we do that for every chirp
             # this is a tradeoff between accuracy and computation
-            
-            time_in_frame = chirp_id / self.chirp_per_frame  / self.frame_per_second                 
+
+            time_in_frame = chirp_id / self.chirp_per_frame  / self.frame_per_second
             intensity,loc = interpolator(t0+time_in_frame) # loc is a set of reflection points (N,3)
             for tx_id in range(self.num_tx):
                 for rx_id in range(self.num_rx):
-                    tx_pos = self.tx_pos[tx_id].unsqueeze(0)  # Convert shape from (3,) to (1, 3)
-                    rx_pos = self.rx_pos[rx_id].unsqueeze(0)  # Convert shape from (3,) to (1, 3)
+                    tx_pos = self.tx_pos[tx_id].unsqueeze(0) + origin_offset.unsqueeze(0)
+                    rx_pos = self.rx_pos[rx_id].unsqueeze(0) + origin_offset.unsqueeze(0)
                     tof = torch.cdist(loc,tx_pos)+ torch.cdist(loc,rx_pos)    # Tx - Surface - Rx
                     frame[tx_id,rx_id,chirp_id,:] = self.chirp(tof,intensity)
         return frame

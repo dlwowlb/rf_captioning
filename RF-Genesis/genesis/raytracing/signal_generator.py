@@ -10,7 +10,12 @@ torch.set_default_device('cuda')
 def calculate_environment_points(environment_pir):
     """
     environment_pir: (H, W, 3) torch tensor, assumed to be on the correct device (e.g., CUDA)
-    Returns: (H*W, 3) point cloud tensor in camera space
+    Returns: (H*W, 3) point cloud tensor in Mitsuba camera space.
+
+    Mitsuba camera convention:
+      x = right, y = up, z = -forward (camera looks along -z)
+    Image convention:
+      i = column (horizontal, left-to-right), j = row (vertical, top-to-bottom)
     """
     H, W, _ = environment_pir.shape
     device = environment_pir.device
@@ -26,9 +31,10 @@ def calculate_environment_points(environment_pir):
     j = torch.arange(0, H, device=device).view(-1, 1).expand(H, W)  # rows
     i = torch.arange(0, W, device=device).view(1, -1).expand(H, W)  # cols
 
-    x = (i - cx) / fx  # [H, W]
-    y = (j - cy) / fy
-    z = torch.ones_like(x, device=device)
+    # Mitsuba camera frame: x=right, y=up (flip image y), z=-forward (negate)
+    x = (i - cx) / fx
+    y = -(j - cy) / fy   # flip: image y-down -> camera y-up
+    z = -torch.ones_like(x, device=device)  # camera looks along -z
 
     xyz = torch.stack((x, y, z), dim=-1) * distance.unsqueeze(-1)  # [H, W, 3]
     points = xyz.reshape(-1, 3)  # [H*W, 3]
@@ -70,24 +76,27 @@ def create_interpolator(_frames, _pointclouds, environment_pir,
                         frame_rate=30, remove_zeros=True,
                         sensor_origin=None, sensor_target=None):
     """
-    수정: sensor_origin/target을 받아서 pointcloud를 세계좌표로 변환
+    Body pointclouds (from Mitsuba si.p) are already in world coordinates.
+    Environment pointclouds (from PIR depth) are in camera space and need
+    camera_to_world_points() transformation.
     """
     num_frames = len(_frames)
     total_time = num_frames / frame_rate
     frames = _frames.copy()
     pointclouds = _pointclouds.copy()
 
-    # ── 핵심 수정: pointcloud를 세계좌표로 변환 ──
-    if sensor_origin is not None and sensor_target is not None:
-        for i in range(len(pointclouds)):
-            pointclouds[i] = camera_to_world_points(
-                pointclouds[i], sensor_origin, sensor_target
-            )
+    # Body pointclouds from Mitsuba si.p are already in world coordinates.
+    # Do NOT apply camera_to_world_points here.
 
     if environment_pir is not None:
         environment_pir = environment_pir.resize((64, 64), resample=Image.Resampling.BILINEAR)
         environment_pir = torch.tensor(np.array(environment_pir), dtype=torch.float32) / 255.0
         environment_points = calculate_environment_points(environment_pir)
+        # Transform environment points from camera space to world coordinates
+        if sensor_origin is not None and sensor_target is not None:
+            environment_points = camera_to_world_points(
+                environment_points, sensor_origin, sensor_target
+            )
         environment_intensity = environment_pir[:, :, 1].flatten()
 
     def interpolator(time):
@@ -140,7 +149,13 @@ def create_interpolator(_frames, _pointclouds, environment_pir,
 
 def generate_signal_frames(body_pirs, body_auxs, envir_pir, radar_config,
                            sensor_origin=None, sensor_target=None):
-    """수정: sensor 위치 정보를 interpolator에 전달"""
+    """
+    Generate radar signal frames.
+
+    sensor_origin/sensor_target: world-coordinate position of the radar sensor.
+    Used for (1) environment pointcloud camera-to-world transform and
+    (2) offsetting antenna TX/RX positions to the sensor location.
+    """
     interpolator = create_interpolator(
         body_pirs, body_auxs, envir_pir,
         frame_rate=30,
@@ -153,7 +168,10 @@ def generate_signal_frames(body_pirs, body_auxs, envir_pir, radar_config,
     total_radar_frame = int(total_motion_frames / 30 * radar.frame_per_second)
     frames = []
     for i in tqdm(range(total_radar_frame), desc="Generating radar frames"):
-        frame_mimo = radar.frameMIMO(interpolator, i * 1.0 / radar.frame_per_second)
+        frame_mimo = radar.frameMIMO(
+            interpolator, i * 1.0 / radar.frame_per_second,
+            sensor_origin=sensor_origin,
+        )
         frames.append(frame_mimo.cpu().numpy())
     frames = np.array(frames)
     return frames
