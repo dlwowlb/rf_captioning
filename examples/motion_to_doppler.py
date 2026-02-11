@@ -416,12 +416,14 @@ def run_rf_simulation(
     sensor_distance = 3.0
     sensor_origin = [
         traj_center[0],
-        traj_center[1] + 1.0,
+        #traj_center[1] + 1.0, #안테나 높이 너무 높음
+        traj_center[1],
         traj_center[2] + sensor_distance,
     ]
     sensor_target = [
         traj_center[0],
-        traj_center[1] + 1.0,
+        #traj_center[1] + 1.0,
+        traj_center[1],
         traj_center[2],
     ]
     print(f"[RF-Genesis] Sensor origin={sensor_origin}, target={sensor_target}")
