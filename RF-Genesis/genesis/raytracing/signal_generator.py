@@ -73,7 +73,8 @@ def camera_to_world_points(points, sensor_origin, sensor_target):
 
 def create_interpolator(_frames, _pointclouds, environment_pir,
                         frame_rate=30, remove_zeros=True,
-                        sensor_origin=None, sensor_target=None):
+                        sensor_origin=None, sensor_target=None,
+                        walls=None):
     """
     Body pointclouds (from Mitsuba si.p) are already in world coordinates.
     Environment pointclouds (from PIR depth) are in camera space and need
@@ -140,6 +141,13 @@ def create_interpolator(_frames, _pointclouds, environment_pir,
             combined_intensity = intensity[mask]
             combined_pointcloud = interpolated_pointcloud[mask]
 
+        # Apply wall penetration effects (attenuation + phase delay)
+        if walls and sensor_origin is not None:
+            for wall in walls:
+                combined_intensity, combined_pointcloud = \
+                    wall.apply_to_interpolated(
+                        combined_intensity, combined_pointcloud, sensor_origin)
+
         return combined_intensity, combined_pointcloud
 
     return interpolator
@@ -148,7 +156,8 @@ def create_interpolator(_frames, _pointclouds, environment_pir,
 
 
 def generate_signal_frames(body_pirs, body_auxs, envir_pir, radar_config,
-                           sensor_origin=None, sensor_target=None):
+                           sensor_origin=None, sensor_target=None,
+                           walls=None):
     """
     Generate radar signal frames.
  
@@ -161,6 +170,7 @@ def generate_signal_frames(body_pirs, body_auxs, envir_pir, radar_config,
         frame_rate=30,
         sensor_origin=sensor_origin,
         sensor_target=sensor_target,
+        walls=walls,
     )
     total_motion_frames = len(body_pirs)
     radar = Radar(radar_config)

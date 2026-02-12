@@ -396,6 +396,7 @@ def run_rf_simulation(
     radar_config_path: str = None,
     skip_environment: bool = True,
     visualize_output: bool = True,
+    walls=None,
 ) -> np.ndarray:
     from genesis.raytracing import pathtracer, signal_generator
     from genesis.visualization import visualize
@@ -441,6 +442,10 @@ def run_rf_simulation(
     print("[RF-Genesis] Step 2/3: Generating radar signal frames...")
     env_pir = None
 
+    if walls:
+        for w in walls:
+            print(f"[RF-Genesis] Through-wall: {w.summary()}")
+
     radar_frames = signal_generator.generate_signal_frames(
         body_pir,
         body_aux,
@@ -448,6 +453,7 @@ def run_rf_simulation(
         radar_config=radar_config_path,
         sensor_origin=sensor_origin,      # ← 추가
         sensor_target=sensor_target,      # ← 추가
+        walls=walls,
     )
 
     print(f"[RF-Genesis] Radar frames shape: {radar_frames.shape}")
