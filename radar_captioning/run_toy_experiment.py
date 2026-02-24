@@ -106,6 +106,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip_stage2", action="store_true",
                         help="Skip Stage 2 (only run Stage 1)")
+    parser.add_argument("--use_pathtracer", action="store_true",
+                        help="Use RF-Genesis Pathtracer for physics simulation "
+                             "(requires GPU + mitsuba + smplx)")
+    parser.add_argument("--radar_config", type=str, default=None,
+                        help="Path to radar config JSON (for pathtracer mode)")
     args = parser.parse_args()
 
     # Config
@@ -129,6 +134,8 @@ def main():
     print(f"  Frames: {args.num_frames}")
     print(f"  Device: {args.device}")
     print(f"  Output: {output_dir}")
+    print(f"  Body Model: SMPL-X (52 joints)")
+    print(f"  Simulation: {'Pathtracer (physics)' if args.use_pathtracer else 'Synthetic (analytical)'}")
     print("=" * 60)
 
     start_time = time.time()
@@ -143,6 +150,8 @@ def main():
         heatmap_size=config.data.heatmap_size,
         output_dir=data_dir,
         seed=args.seed,
+        use_pathtracer=args.use_pathtracer,
+        radar_config_path=args.radar_config,
     )
 
     # ================================================================

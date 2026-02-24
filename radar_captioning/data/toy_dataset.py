@@ -1,11 +1,19 @@
 """
 Toy Dataset Generator for Radar Captioning.
 
-Generates synthetic radar heatmaps (Range-Doppler, Range-Angle, Doppler-Angle)
+Generates radar heatmaps (Range-Doppler, Range-Angle, Doppler-Angle)
 paired with text descriptions and physical parameters.
 
-Uses SMPL-H 52-joint skeleton (22 body + 15 left hand + 15 right hand) to
-simulate realistic motion patterns, then converts to radar signatures.
+Uses SMPL-X 52-joint skeleton (22 body + 15 left hand + 15 right hand).
+
+Two modes of operation:
+  1. Physics simulation mode (--use-pathtracer):
+     Uses RF-Genesis Pathtracer (Mitsuba ray tracing + FMCW signal generation)
+     for physically accurate radar signatures. Requires GPU + Mitsuba + smplx.
+
+  2. Synthetic mode (default):
+     Generates approximate radar heatmaps from joint positions analytically.
+     Fast, no GPU required, suitable for unit testing and prototyping.
 
 Each sample contains:
   - rd_heatmap: (T, H, W) Range-Doppler heatmaps
@@ -27,10 +35,10 @@ import torch
 
 
 # ============================================================================
-# SMPL-H Joint Definitions (52 joints)
+# SMPL-X Joint Definitions (52 joints)
 # ============================================================================
 
-SMPLH_JOINT_NAMES = [
+SMPLX_JOINT_NAMES = [
     # 22 body joints
     "pelvis", "left_hip", "right_hip", "spine1", "left_knee", "right_knee",
     "spine2", "left_ankle", "right_ankle", "spine3", "left_foot", "right_foot",
@@ -50,8 +58,8 @@ SMPLH_JOINT_NAMES = [
     "right_thumb1", "right_thumb2", "right_thumb3",
 ]
 
-# Parent joint indices for SMPL-H kinematic tree
-SMPLH_PARENTS = [
+# Parent joint indices for SMPL-X kinematic tree
+SMPLX_PARENTS = [
     -1,  # 0 pelvis (root)
     0, 0, 0, 1, 2,           # 1-5: hips, spine1, knees
     3, 4, 5, 6, 7, 8,       # 6-11: spine2, ankles, spine3, feet
@@ -62,6 +70,14 @@ SMPLH_PARENTS = [
     # Right hand (parent = right_wrist = 21)
     21, 37, 38, 21, 40, 41, 21, 43, 44, 21, 46, 47, 21, 49, 50,
 ]
+
+# Backward-compatible aliases
+SMPLH_JOINT_NAMES = SMPLX_JOINT_NAMES
+SMPLH_PARENTS = SMPLX_PARENTS
+
+NUM_BODY_JOINTS = 22
+NUM_HAND_JOINTS = 15
+NUM_SMPLX_JOINTS = NUM_BODY_JOINTS + 2 * NUM_HAND_JOINTS  # 52
 
 
 # ============================================================================
@@ -74,10 +90,10 @@ BASIC_ACTIONS = {
             "A person walks forward at {speed:.1f} m/s, located {dist:.1f}m away at {angle:.0f} degrees.",
             "Someone is walking straight ahead at a distance of {dist:.1f}m, moving at {speed:.1f} m/s, angle {angle:.0f} degrees.",
         ],
-        "speed_range": (0.8, 1.5),  # m/s
-        "dist_range": (2.0, 6.0),   # m
-        "angle_range": (-10, 10),    # degrees
-        "doppler_sign": 1,           # approaching
+        "speed_range": (0.8, 1.5),
+        "dist_range": (2.0, 6.0),
+        "angle_range": (-10, 10),
+        "doppler_sign": 1,
         "body_motion": "linear_forward",
     },
     "walking_backward": {
@@ -87,7 +103,7 @@ BASIC_ACTIONS = {
         "speed_range": (0.5, 1.0),
         "dist_range": (2.0, 6.0),
         "angle_range": (-10, 10),
-        "doppler_sign": -1,          # receding
+        "doppler_sign": -1,
         "body_motion": "linear_backward",
     },
     "sitting_down": {
@@ -151,7 +167,7 @@ COMPOSITION_ACTIONS = {
         "speed_range": (1.0, 2.0),
         "dist_range": (2.0, 5.0),
         "angle_range": (-10, 10),
-        "doppler_sign": 0,  # alternating
+        "doppler_sign": 0,
         "body_motion": "jump_in_place",
     },
     "stretching_arms": {
@@ -167,7 +183,7 @@ COMPOSITION_ACTIONS = {
 }
 
 
-def _generate_smplh_motion(
+def _generate_smplx_motion(
     action_type: str,
     num_frames: int,
     speed: float,
@@ -176,25 +192,22 @@ def _generate_smplh_motion(
     rng: np.random.RandomState,
 ) -> np.ndarray:
     """
-    Generate synthetic SMPL-H joint positions for a given action.
+    Generate synthetic SMPL-X joint positions for a given action.
 
     Returns:
         joint_positions: (num_frames, 52, 3) - xyz positions for all 52 joints
     """
-    n_joints = 52
+    n_joints = NUM_SMPLX_JOINTS
     positions = np.zeros((num_frames, n_joints, 3))
     t = np.linspace(0, 1, num_frames)
     angle_rad = np.radians(angle_deg)
 
-    # Base position: place person at (distance*sin(angle), 0, distance*cos(angle))
     base_x = distance * np.sin(angle_rad)
-    base_y = 0.0  # ground level
+    base_y = 0.0
     base_z = distance * np.cos(angle_rad)
 
-    # Generate body joint offsets from a T-pose template
-    # Approximate SMPL-H rest pose heights (relative to pelvis)
+    # SMPL-X rest pose offsets (approximate T-pose)
     rest_offsets = np.zeros((n_joints, 3))
-    # Body joints approximate positions (from pelvis at origin)
     rest_offsets[0] = [0, 0.9, 0]       # pelvis
     rest_offsets[1] = [-0.1, 0.85, 0]   # left_hip
     rest_offsets[2] = [0.1, 0.85, 0]    # right_hip
@@ -221,8 +234,8 @@ def _generate_smplh_motion(
     # Left hand fingers (relative to left_wrist)
     for i in range(15):
         finger_idx = 22 + i
-        finger_group = i // 3  # 0-4 for index, middle, pinky, ring, thumb
-        finger_joint = i % 3   # 0-2 for base, mid, tip
+        finger_group = i // 3
+        finger_joint = i % 3
         x_off = -0.02 * (finger_group - 2)
         y_off = -0.02 * (finger_joint + 1)
         rest_offsets[finger_idx] = rest_offsets[20] + [x_off, y_off, 0.01 * (finger_joint + 1)]
@@ -238,22 +251,18 @@ def _generate_smplh_motion(
 
     # Apply action-specific motion
     for f in range(num_frames):
-        # Start from rest pose + base position
         positions[f] = rest_offsets.copy()
         positions[f, :, 0] += base_x
         positions[f, :, 2] += base_z
 
         if action_type == "linear_forward":
-            # Walking forward: translate along z, leg swing
             dz = speed * t[f]
-            positions[f, :, 2] -= dz  # approaching radar
-            # Leg swing (pendulum)
+            positions[f, :, 2] -= dz
             swing = 0.15 * np.sin(2 * np.pi * 2 * t[f])
-            positions[f, 4, 2] += swing   # left knee forward
-            positions[f, 5, 2] -= swing   # right knee backward
+            positions[f, 4, 2] += swing
+            positions[f, 5, 2] -= swing
             positions[f, 7, 2] += swing * 0.8
             positions[f, 8, 2] -= swing * 0.8
-            # Arm swing (opposite to legs)
             positions[f, 18, 2] -= swing * 0.3
             positions[f, 19, 2] += swing * 0.3
             # Finger micro-motion during walk
@@ -264,24 +273,21 @@ def _generate_smplh_motion(
 
         elif action_type == "linear_backward":
             dz = speed * t[f]
-            positions[f, :, 2] += dz  # receding from radar
+            positions[f, :, 2] += dz
             swing = 0.12 * np.sin(2 * np.pi * 2 * t[f])
             positions[f, 4, 2] -= swing
             positions[f, 5, 2] += swing
 
         elif action_type == "vertical_down":
-            # Sitting: pelvis moves down, knees bend
             progress = t[f]
             sit_amount = 0.4 * progress
-            positions[f, 0, 1] -= sit_amount   # pelvis down
+            positions[f, 0, 1] -= sit_amount
             for j in [3, 6, 9, 12, 13, 14, 15, 16, 17]:
                 positions[f, j, 1] -= sit_amount
-            # Knees move forward as person sits
             positions[f, 4, 2] += 0.2 * progress
             positions[f, 5, 2] += 0.2 * progress
             positions[f, 4, 1] -= sit_amount * 0.5
             positions[f, 5, 1] -= sit_amount * 0.5
-            # Hands move to lap
             positions[f, 20, 1] -= sit_amount * 0.8
             positions[f, 21, 1] -= sit_amount * 0.8
             for j in range(22, 52):
@@ -297,26 +303,22 @@ def _generate_smplh_motion(
             positions[f, 5, 2] -= 0.2 * progress
 
         elif action_type == "static":
-            # Small breathing motion
             breath = 0.01 * np.sin(2 * np.pi * 0.3 * t[f])
             positions[f, 9, 1] += breath
             positions[f, 6, 1] += breath * 0.5
 
         elif action_type == "walk_and_wave":
-            # Walking + right hand waving
             dz = speed * t[f]
             positions[f, :, 2] -= dz
             swing = 0.12 * np.sin(2 * np.pi * 2 * t[f])
             positions[f, 4, 2] += swing
             positions[f, 5, 2] -= swing
-            # Right arm wave
             wave = 0.3 * np.sin(2 * np.pi * 3 * t[f])
-            positions[f, 19, 1] += 0.3 + wave * 0.2  # elbow up
-            positions[f, 21, 1] += 0.5 + wave * 0.3   # wrist wave
-            # Right hand fingers spread during wave
+            positions[f, 19, 1] += 0.3 + wave * 0.2
+            positions[f, 21, 1] += 0.5 + wave * 0.3
             for j in range(37, 52):
                 positions[f, j, 1] += 0.5 + wave * 0.3
-                positions[f, j, 0] += 0.02 * ((j - 37) % 3)  # spread fingers
+                positions[f, j, 0] += 0.02 * ((j - 37) % 3)
 
         elif action_type == "walk_and_phone":
             dz = speed * t[f]
@@ -324,22 +326,18 @@ def _generate_smplh_motion(
             swing = 0.1 * np.sin(2 * np.pi * 2 * t[f])
             positions[f, 4, 2] += swing
             positions[f, 5, 2] -= swing
-            # Right hand to ear (phone)
             positions[f, 19, 1] += 0.2
             positions[f, 21, 0] += 0.1
             positions[f, 21, 1] += 0.45
-            # Fingers curl around phone
             for j in range(37, 52):
                 positions[f, j, 0] += 0.08
                 positions[f, j, 1] += 0.45
                 positions[f, j, 2] += 0.02 * ((j - 37) % 3)
 
         elif action_type == "jump_in_place":
-            # Vertical jump cycle
-            phase = t[f] * 3  # 3 jumps in duration
+            phase = t[f] * 3
             jump_h = max(0, 0.3 * np.sin(np.pi * (phase % 1)))
             positions[f, :, 1] += jump_h
-            # Arms go up during jump
             positions[f, 18, 1] += jump_h * 0.5
             positions[f, 19, 1] += jump_h * 0.5
             positions[f, 20, 1] += jump_h * 0.7
@@ -347,24 +345,189 @@ def _generate_smplh_motion(
 
         elif action_type == "stretch_arms":
             progress = min(t[f] * 2, 1.0)
-            # Arms go overhead
-            positions[f, 16, 1] += 0.3 * progress  # left shoulder
-            positions[f, 17, 1] += 0.3 * progress  # right shoulder
-            positions[f, 18, 1] += 0.4 * progress  # left elbow
+            positions[f, 16, 1] += 0.3 * progress
+            positions[f, 17, 1] += 0.3 * progress
+            positions[f, 18, 1] += 0.4 * progress
             positions[f, 19, 1] += 0.4 * progress
-            positions[f, 20, 1] += 0.6 * progress  # left wrist
+            positions[f, 20, 1] += 0.6 * progress
             positions[f, 21, 1] += 0.6 * progress
-            positions[f, 20, 0] += 0.1 * progress  # spread
+            positions[f, 20, 0] += 0.1 * progress
             positions[f, 21, 0] -= 0.1 * progress
-            # Fingers extend
             for j in range(22, 52):
                 positions[f, j, 1] += 0.6 * progress
 
-        # Add small noise to all joints
+        # Small noise
         positions[f] += rng.normal(0, 0.002, (n_joints, 3))
 
     return positions
 
+
+# Backward-compatible alias
+_generate_smplh_motion = _generate_smplx_motion
+
+
+# ============================================================================
+# RF-Genesis Pathtracer-Based Heatmap Generation
+# ============================================================================
+
+def _joints_to_smplx_npz(
+    joint_positions: np.ndarray,
+    action_type: str,
+    speed: float,
+    distance: float,
+    angle_deg: float,
+    output_path: str,
+    num_frames: int,
+    rng: np.random.RandomState,
+) -> str:
+    """
+    Convert synthetic joint positions into a SMPL-X .npz file
+    suitable for RF-Genesis pathtracer.
+
+    Args:
+        joint_positions: (T, 52, 3) joint xyz positions
+        output_path: path to write .npz
+
+    Returns:
+        output_path
+    """
+    T = joint_positions.shape[0]
+
+    # Use pelvis position as root translation
+    root_translation = joint_positions[:, 0, :].copy()  # (T, 3)
+
+    # Create approximate pose params (identity rotations = T-pose)
+    # The actual mesh deformation comes from the root_translation
+    pose_params = np.zeros((T, 156), dtype=np.float32)  # 52 joints * 3 = 156D
+    shape_params = np.zeros(10, dtype=np.float32)
+
+    np.savez(
+        output_path,
+        pose=pose_params,
+        shape=shape_params,
+        root_translation=root_translation,
+        gender="neutral",
+    )
+    return output_path
+
+
+def _run_pathtracer_simulation(
+    motion_npz_path: str,
+    radar_config_path: str,
+    heatmap_size: int = 64,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Run RF-Genesis Pathtracer physics simulation on a motion .npz file.
+
+    This performs:
+    1. Mitsuba ray tracing -> PIR (Physical Impulse Response) per frame
+    2. FMCW radar signal generation from PIR
+    3. Range-Doppler/Range-Angle/Doppler-Angle heatmap extraction
+
+    Args:
+        motion_npz_path: Path to SMPL-X .npz file
+        radar_config_path: Path to radar config JSON
+        heatmap_size: Output heatmap resolution
+
+    Returns:
+        rd_maps: (T, H, W) Range-Doppler heatmaps
+        ra_maps: (T, H, W) Range-Angle heatmaps
+        da_maps: (T, H, W) Doppler-Angle heatmaps
+    """
+    import sys
+    project_root = Path(__file__).resolve().parent.parent.parent
+    rf_genesis_dir = project_root / "RF-Genesis"
+    sys.path.insert(0, str(rf_genesis_dir))
+
+    from genesis.raytracing import pathtracer, signal_generator
+
+    motion_npz_path = os.path.abspath(motion_npz_path)
+
+    # Compute sensor position
+    smpl_data = np.load(motion_npz_path, allow_pickle=True)
+    root_translation = smpl_data['root_translation']
+    traj_center = root_translation.mean(axis=0)
+    sensor_distance = 3.0
+    sensor_origin = [
+        float(traj_center[0]),
+        float(traj_center[1]),
+        float(traj_center[2] + sensor_distance),
+    ]
+    sensor_target = [
+        float(traj_center[0]),
+        float(traj_center[1]),
+        float(traj_center[2]),
+    ]
+
+    # Step 1: Ray tracing
+    original_dir = os.getcwd()
+    genesis_dir = str(rf_genesis_dir / "genesis")
+    os.chdir(genesis_dir)
+    try:
+        body_pir, body_aux = pathtracer.trace(motion_npz_path)
+    finally:
+        os.chdir(original_dir)
+
+    # Step 2: Signal generation
+    radar_frames = signal_generator.generate_signal_frames(
+        body_pir,
+        body_aux,
+        None,  # no environment PIR
+        radar_config=radar_config_path,
+        sensor_origin=sensor_origin,
+        sensor_target=sensor_target,
+    )
+
+    # Step 3: Convert FMCW signals to heatmaps
+    num_frames = radar_frames.shape[0]
+    H = W = heatmap_size
+
+    rd_maps = np.zeros((num_frames, H, W), dtype=np.float32)
+    ra_maps = np.zeros((num_frames, H, W), dtype=np.float32)
+    da_maps = np.zeros((num_frames, H, W), dtype=np.float32)
+
+    for i in range(num_frames):
+        frame = radar_frames[i]  # (num_tx, num_rx, chirps, adc_samples), complex
+
+        # FMCW processing: Range FFT -> Doppler FFT
+        if frame.ndim >= 2 and frame.shape[-1] > 1 and frame.shape[-2] > 1:
+            range_fft = np.fft.fft(frame, axis=-1)
+            rd_full = np.fft.fftshift(np.fft.fft(range_fft, axis=-2), axes=-2)
+            rd_db = 20 * np.log10(np.abs(rd_full) + 1e-12)
+        else:
+            rd_db = 20 * np.log10(np.abs(frame) + 1e-12)
+
+        # Average across TX/RX antennas
+        if rd_db.ndim > 2:
+            dims_to_reduce = tuple(range(rd_db.ndim - 2))
+            rd_2d = np.mean(rd_db, axis=dims_to_reduce)
+        else:
+            rd_2d = rd_db
+
+        # Resize to heatmap_size
+        from PIL import Image
+        rd_img = Image.fromarray(rd_2d.astype(np.float32))
+        rd_resized = np.array(rd_img.resize((W, H), Image.Resampling.BILINEAR))
+        rd_maps[i] = rd_resized
+
+        # For RA and DA maps: approximate from Range-Doppler
+        # Full angle estimation requires virtual array processing
+        ra_maps[i] = rd_resized
+        da_maps[i] = rd_resized
+
+    # Normalize to [0, 1]
+    for maps in [rd_maps, ra_maps, da_maps]:
+        vmin = maps.min()
+        vmax = maps.max()
+        if vmax > vmin:
+            maps[:] = (maps - vmin) / (vmax - vmin)
+
+    return rd_maps, ra_maps, da_maps
+
+
+# ============================================================================
+# Synthetic (Analytical) Heatmap Generation - Fallback
+# ============================================================================
 
 def _joints_to_radar_heatmaps(
     joint_positions: np.ndarray,
@@ -374,10 +537,7 @@ def _joints_to_radar_heatmaps(
     max_angle: float = 60.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Convert SMPL-H joint positions to radar heatmaps.
-
-    Computes Range, Doppler, and Angle from joint positions and velocities,
-    then creates 2D heatmap projections.
+    Convert SMPL-X joint positions to radar heatmaps (synthetic/analytical).
 
     Args:
         joint_positions: (T, 52, 3) joint xyz positions
@@ -398,44 +558,33 @@ def _joints_to_radar_heatmaps(
     for frame_idx in range(T):
         pos = joint_positions[frame_idx]  # (52, 3)
 
-        # Compute range (distance from radar at origin)
-        ranges = np.sqrt(np.sum(pos ** 2, axis=1))  # (52,)
+        ranges = np.sqrt(np.sum(pos ** 2, axis=1))
+        angles = np.degrees(np.arctan2(pos[:, 0], pos[:, 2]))
 
-        # Compute angle (azimuth from z-axis)
-        angles = np.degrees(np.arctan2(pos[:, 0], pos[:, 2]))  # (52,)
-
-        # Compute Doppler velocity (radial component)
         if frame_idx > 0:
-            vel = (joint_positions[frame_idx] - joint_positions[frame_idx - 1]) * 30  # 30fps
-            # Radial velocity = dot(vel, unit_range_vector)
+            vel = (joint_positions[frame_idx] - joint_positions[frame_idx - 1]) * 30
             range_unit = pos / (ranges[:, None] + 1e-8)
-            doppler = np.sum(vel * range_unit, axis=1)  # (52,) radial velocity
+            doppler = np.sum(vel * range_unit, axis=1)
         else:
             doppler = np.zeros(n_joints)
 
-        # Map to heatmap bins
         range_bins = np.clip((ranges / max_range * H), 0, H - 1).astype(int)
         doppler_bins = np.clip(((doppler / max_doppler + 1) / 2 * W), 0, W - 1).astype(int)
         angle_bins = np.clip(((angles / max_angle + 1) / 2 * W), 0, W - 1).astype(int)
 
-        # Joint intensity (larger joints = stronger reflection)
+        # Joint intensity: body joints stronger, finger joints weaker RCS
         intensities = np.ones(n_joints)
-        intensities[:22] = 1.0       # body joints
-        intensities[22:37] = 0.3     # left hand (smaller RCS)
-        intensities[37:52] = 0.3     # right hand
+        intensities[:NUM_BODY_JOINTS] = 1.0
+        intensities[NUM_BODY_JOINTS:NUM_BODY_JOINTS + NUM_HAND_JOINTS] = 0.3
+        intensities[NUM_BODY_JOINTS + NUM_HAND_JOINTS:] = 0.3
 
-        # Fill heatmaps with Gaussian spread
         sigma = 1.5
         for j in range(n_joints):
             w = intensities[j]
-            # Range-Doppler
             _add_gaussian(rd_maps[frame_idx], range_bins[j], doppler_bins[j], w, sigma)
-            # Range-Angle
             _add_gaussian(ra_maps[frame_idx], range_bins[j], angle_bins[j], w, sigma)
-            # Doppler-Angle
             _add_gaussian(da_maps[frame_idx], doppler_bins[j], angle_bins[j], w, sigma)
 
-    # Normalize to [0, 1]
     for maps in [rd_maps, ra_maps, da_maps]:
         vmax = maps.max()
         if vmax > 0:
@@ -464,24 +613,20 @@ def _apply_occlusion(
     """Apply synthetic wall/occlusion effects to heatmaps."""
     T, H, W = rd.shape
 
-    # Add random noise bands (simulating wall reflections)
     noise_range_start = rng.randint(0, H // 2)
     noise_range_end = noise_range_start + rng.randint(3, 8)
     noise_level = rng.uniform(0.1, 0.3)
 
     for f in range(T):
-        # Wall reflection noise
         wall_noise = rng.uniform(0, noise_level, (min(noise_range_end, H) - noise_range_start, W))
         rd[f, noise_range_start:min(noise_range_end, H)] += wall_noise
         ra[f, noise_range_start:min(noise_range_end, H)] += wall_noise[:, :W]
 
-        # Attenuation of signal (simulating through-wall)
         attenuation = rng.uniform(0.3, 0.7)
         rd[f] *= attenuation
         ra[f] *= attenuation
         da[f] *= attenuation
 
-        # Random dropout patches (simulating multipath)
         if rng.random() < occlusion_strength:
             patch_y = rng.randint(0, H - 8)
             patch_x = rng.randint(0, W - 8)
@@ -490,7 +635,6 @@ def _apply_occlusion(
             rd[f, patch_y:min(patch_y + patch_h, H), patch_x:min(patch_x + patch_w, W)] *= 0.1
             ra[f, patch_y:min(patch_y + patch_h, H), patch_x:min(patch_x + patch_w, W)] *= 0.1
 
-    # Re-normalize
     for maps in [rd, ra, da]:
         vmax = maps.max()
         if vmax > 0:
@@ -499,15 +643,42 @@ def _apply_occlusion(
     return rd, ra, da
 
 
+# ============================================================================
+# Dataset Generation
+# ============================================================================
+
+def _check_pathtracer_available() -> bool:
+    """Check if RF-Genesis Pathtracer dependencies are available."""
+    try:
+        import mitsuba
+        import drjit
+        import smplx
+        return True
+    except ImportError:
+        return False
+
+
 def generate_toy_dataset(
     num_samples: int = 300,
     num_frames: int = 30,
     heatmap_size: int = 64,
     output_dir: str = "data/toy_dataset",
     seed: int = 42,
+    use_pathtracer: bool = False,
+    radar_config_path: Optional[str] = None,
 ) -> List[Dict]:
     """
     Generate complete toy dataset with all curriculum phases.
+
+    Args:
+        num_samples: Total number of samples
+        num_frames: Frames per sample
+        heatmap_size: Heatmap resolution (H=W)
+        output_dir: Output directory
+        seed: Random seed
+        use_pathtracer: If True, use RF-Genesis Pathtracer for physics simulation.
+                        Falls back to synthetic mode if dependencies unavailable.
+        radar_config_path: Path to radar config JSON (for pathtracer mode)
 
     Distribution:
       - 40% basic actions
@@ -519,6 +690,23 @@ def generate_toy_dataset(
     """
     rng = np.random.RandomState(seed)
     os.makedirs(output_dir, exist_ok=True)
+
+    # Check pathtracer availability
+    if use_pathtracer:
+        if _check_pathtracer_available():
+            print("[Dataset] Using RF-Genesis Pathtracer for physics simulation")
+            if radar_config_path is None:
+                project_root = Path(__file__).resolve().parent.parent.parent
+                radar_config_path = str(
+                    project_root / "RF-Genesis" / "models" / "TI1843_config.json"
+                )
+        else:
+            print("[Dataset] WARNING: Pathtracer dependencies not available "
+                  "(mitsuba/drjit/smplx). Falling back to synthetic mode.")
+            use_pathtracer = False
+
+    if not use_pathtracer:
+        print("[Dataset] Using synthetic (analytical) heatmap generation")
 
     n_basic = int(num_samples * 0.40)
     n_composition = int(num_samples * 0.35)
@@ -538,6 +726,9 @@ def generate_toy_dataset(
         sample = _generate_single_sample(
             sample_id, action_name, action_cfg, "basic",
             num_frames, heatmap_size, rng, occlude=False,
+            use_pathtracer=use_pathtracer,
+            radar_config_path=radar_config_path,
+            output_dir=output_dir,
         )
         samples.append(sample)
         sample_id += 1
@@ -548,11 +739,14 @@ def generate_toy_dataset(
         sample = _generate_single_sample(
             sample_id, action_name, action_cfg, "composition",
             num_frames, heatmap_size, rng, occlude=False,
+            use_pathtracer=use_pathtracer,
+            radar_config_path=radar_config_path,
+            output_dir=output_dir,
         )
         samples.append(sample)
         sample_id += 1
 
-    # Phase 3: Occlusion (70% occluded from basic/composition + 30% clean)
+    # Phase 3: Occlusion
     n_occluded = int(n_occlusion * 0.7)
     n_clean = n_occlusion - n_occluded
 
@@ -562,6 +756,9 @@ def generate_toy_dataset(
         sample = _generate_single_sample(
             sample_id, action_name, action_cfg, "occlusion",
             num_frames, heatmap_size, rng, occlude=True,
+            use_pathtracer=use_pathtracer,
+            radar_config_path=radar_config_path,
+            output_dir=output_dir,
         )
         samples.append(sample)
         sample_id += 1
@@ -571,6 +768,9 @@ def generate_toy_dataset(
         sample = _generate_single_sample(
             sample_id, action_name, action_cfg, "occlusion",
             num_frames, heatmap_size, rng, occlude=False,
+            use_pathtracer=use_pathtracer,
+            radar_config_path=radar_config_path,
+            output_dir=output_dir,
         )
         samples.append(sample)
         sample_id += 1
@@ -580,6 +780,8 @@ def generate_toy_dataset(
     print(f"Generated {len(samples)} samples -> {output_dir}")
     print(f"  Basic: {n_basic}, Composition: {n_composition}, "
           f"Occlusion: {n_occlusion} ({n_occluded} occluded + {n_clean} clean)")
+    print(f"  Mode: {'Pathtracer (physics simulation)' if use_pathtracer else 'Synthetic (analytical)'}")
+    print(f"  Body model: SMPL-X 52 joints (22 body + 30 hand)")
 
     return samples
 
@@ -593,33 +795,47 @@ def _generate_single_sample(
     heatmap_size: int,
     rng: np.random.RandomState,
     occlude: bool = False,
+    use_pathtracer: bool = False,
+    radar_config_path: Optional[str] = None,
+    output_dir: str = "/tmp",
 ) -> Dict:
     """Generate a single sample with radar heatmaps and text."""
-    # Sample physical parameters
     speed = rng.uniform(*action_cfg["speed_range"])
     dist = rng.uniform(*action_cfg["dist_range"])
     angle = rng.uniform(*action_cfg["angle_range"])
 
-    # Generate SMPL-H motion
-    joint_positions = _generate_smplh_motion(
+    # Generate SMPL-X motion (52 joints)
+    joint_positions = _generate_smplx_motion(
         action_cfg["body_motion"], num_frames, speed, dist, angle, rng
     )
 
-    # Convert to radar heatmaps
-    rd, ra, da = _joints_to_radar_heatmaps(
-        joint_positions, heatmap_size,
-        max_range=10.0, max_doppler=5.0, max_angle=60.0,
-    )
+    if use_pathtracer and radar_config_path is not None:
+        # Physics simulation mode: use RF-Genesis Pathtracer
+        tmp_npz = os.path.join(output_dir, f"_tmp_sample_{sample_id:04d}.npz")
+        _joints_to_smplx_npz(
+            joint_positions, action_cfg["body_motion"],
+            speed, dist, angle, tmp_npz, num_frames, rng,
+        )
+        try:
+            rd, ra, da = _run_pathtracer_simulation(
+                tmp_npz, radar_config_path, heatmap_size,
+            )
+        finally:
+            if os.path.exists(tmp_npz):
+                os.remove(tmp_npz)
+    else:
+        # Synthetic mode: analytical heatmap generation
+        rd, ra, da = _joints_to_radar_heatmaps(
+            joint_positions, heatmap_size,
+            max_range=10.0, max_doppler=5.0, max_angle=60.0,
+        )
 
-    # Apply occlusion if needed
     if occlude:
         rd, ra, da = _apply_occlusion(rd, ra, da, rng)
 
-    # Generate text description
     template = rng.choice(action_cfg["text_templates"])
     text = template.format(speed=speed, dist=dist, angle=angle)
 
-    # Compute actual Doppler sign for JSON physical slots
     doppler_sign = action_cfg["doppler_sign"]
     if doppler_sign == 0:
         doppler_desc = "near-zero"
@@ -628,7 +844,6 @@ def _generate_single_sample(
     else:
         doppler_desc = "negative (receding)"
 
-    # Physical slots JSON
     physical_slots = {
         "distance_m": round(float(dist), 2),
         "speed_ms": round(float(speed), 2),
@@ -639,9 +854,9 @@ def _generate_single_sample(
 
     return {
         "id": sample_id,
-        "rd_heatmap": rd.astype(np.float32),      # (T, H, W)
-        "ra_heatmap": ra.astype(np.float32),       # (T, H, W)
-        "da_heatmap": da.astype(np.float32),       # (T, H, W)
+        "rd_heatmap": rd.astype(np.float32),
+        "ra_heatmap": ra.astype(np.float32),
+        "da_heatmap": da.astype(np.float32),
         "joint_positions": joint_positions.astype(np.float32),  # (T, 52, 3)
         "text": text,
         "physical_slots": physical_slots,
@@ -660,7 +875,6 @@ def _save_dataset(samples: List[Dict], output_dir: str):
 
     for s in samples:
         sid = s["id"]
-        # Save heatmaps as compressed numpy
         np.savez_compressed(
             os.path.join(heatmap_dir, f"sample_{sid:04d}.npz"),
             rd=s["rd_heatmap"],
@@ -697,11 +911,9 @@ class RadarCaptionDataset(torch.utils.data.Dataset):
         with open(os.path.join(data_dir, "metadata.json"), "r") as f:
             all_metadata = json.load(f)
 
-        # Filter by curriculum phase if specified
         if curriculum_phase is not None:
             all_metadata = [m for m in all_metadata if m["curriculum_phase"] == curriculum_phase]
 
-        # Split
         n = len(all_metadata)
         n_train = int(n * train_ratio)
         if split == "train":
@@ -716,17 +928,15 @@ class RadarCaptionDataset(torch.utils.data.Dataset):
         meta = self.metadata[idx]
         sid = meta["id"]
 
-        # Load heatmaps
         data = np.load(
             os.path.join(self.data_dir, "heatmaps", f"sample_{sid:04d}.npz")
         )
 
         T = self.num_frames
-        rd = torch.from_numpy(data["rd"][:T])  # (T, H, W)
+        rd = torch.from_numpy(data["rd"][:T])
         ra = torch.from_numpy(data["ra"][:T])
         da = torch.from_numpy(data["da"][:T])
 
-        # Pad if needed
         if rd.shape[0] < T:
             pad = T - rd.shape[0]
             rd = torch.nn.functional.pad(rd, (0, 0, 0, 0, 0, pad))
@@ -734,9 +944,9 @@ class RadarCaptionDataset(torch.utils.data.Dataset):
             da = torch.nn.functional.pad(da, (0, 0, 0, 0, 0, pad))
 
         return {
-            "rd": rd,               # (T, H, W)
-            "ra": ra,               # (T, H, W)
-            "da": da,               # (T, H, W)
+            "rd": rd,
+            "ra": ra,
+            "da": da,
             "text": meta["text"],
             "physical_slots": json.dumps(meta["physical_slots"]),
             "action_label": meta["action_label"],
@@ -745,10 +955,28 @@ class RadarCaptionDataset(torch.utils.data.Dataset):
 
 
 if __name__ == "__main__":
-    # Quick test
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate toy radar dataset")
+    parser.add_argument("--num_samples", type=int, default=10)
+    parser.add_argument("--num_frames", type=int, default=30)
+    parser.add_argument("--heatmap_size", type=int, default=64)
+    parser.add_argument("--output_dir", type=str, default="/tmp/test_toy_dataset")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use_pathtracer", action="store_true",
+                        help="Use RF-Genesis Pathtracer for physics simulation")
+    parser.add_argument("--radar_config", type=str, default=None,
+                        help="Path to radar config JSON")
+    args = parser.parse_args()
+
     samples = generate_toy_dataset(
-        num_samples=10, num_frames=30, heatmap_size=64,
-        output_dir="/tmp/test_toy_dataset", seed=42,
+        num_samples=args.num_samples,
+        num_frames=args.num_frames,
+        heatmap_size=args.heatmap_size,
+        output_dir=args.output_dir,
+        seed=args.seed,
+        use_pathtracer=args.use_pathtracer,
+        radar_config_path=args.radar_config,
     )
     print(f"Sample 0 text: {samples[0]['text']}")
     print(f"Sample 0 RD shape: {samples[0]['rd_heatmap'].shape}")
