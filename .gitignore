@@ -14,3 +14,11 @@
 
 !/examples/
 
+# Radar Captioning Pipeline
+!/radar_captioning/
+
+# Ignore output and cached files
+output/
+__pycache__/
+*.pyc
+
