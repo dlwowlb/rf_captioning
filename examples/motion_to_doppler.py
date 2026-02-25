@@ -126,10 +126,13 @@ def generate_motion_hymotion(
 # ============================================================================
 
 def _rot6d_to_rotation_matrix_np(rot6d):
-    """Convert 6D rotation to rotation matrix (Gram-Schmidt)."""
-    x = rot6d.reshape(*rot6d.shape[:-1], 3, 2)
-    a1 = x[..., 0]
-    a2 = x[..., 1]
+    """Convert 6D rotation to rotation matrix (Gram-Schmidt).
+
+    The 6D representation stores two 3D vectors consecutively:
+    [a1_x, a1_y, a1_z, a2_x, a2_y, a2_z] (first two columns of the rotation matrix).
+    """
+    a1 = rot6d[..., :3]
+    a2 = rot6d[..., 3:]
     b1 = a1 / (np.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
     dot = np.sum(b1 * a2, axis=-1, keepdims=True)
     b2 = a2 - dot * b1
@@ -139,10 +142,21 @@ def _rot6d_to_rotation_matrix_np(rot6d):
 
 
 def _rotation_matrix_to_axis_angle_np(rot_mat):
-    """Convert rotation matrix to axis-angle via scipy."""
+    """Convert rotation matrix to axis-angle via scipy.
+
+    Projects each matrix to the nearest valid rotation (SO(3)) via SVD
+    to handle numerical imprecision from the Gram-Schmidt process.
+    """
     from scipy.spatial.transform import Rotation
     orig_shape = rot_mat.shape[:-2]
     flat = rot_mat.reshape(-1, 3, 3)
+    # SVD projection: R_valid = U @ Vt, with det correction to ensure SO(3)
+    U, _, Vt = np.linalg.svd(flat)
+    dets = np.linalg.det(U @ Vt)
+    # Flip last column of U where determinant is negative
+    sign = np.ones_like(U)
+    sign[dets < 0, :, -1] = -1
+    flat = (U * sign) @ Vt
     r = Rotation.from_matrix(flat)
     aa = r.as_rotvec()
     return aa.reshape(*orig_shape, 3)
