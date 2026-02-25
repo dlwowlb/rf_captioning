@@ -114,8 +114,9 @@ class DataConfig:
     num_frames: int = 30            # frames per sample (1 sec at 30fps)
     heatmap_size: int = 64
     train_ratio: float = 0.8
-    # SMPL-H joints
-    num_smplh_joints: int = 52      # 22 body + 15 left hand + 15 right hand
+    # SMPL-X joints (compatible with SMPL-H layout)
+    num_smplx_joints: int = 52      # 22 body + 15 left hand + 15 right hand
+    num_smplh_joints: int = 52      # backward-compatible alias
     num_body_joints: int = 22
     num_hand_joints: int = 15
 
