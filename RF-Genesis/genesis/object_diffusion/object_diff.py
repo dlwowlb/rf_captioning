@@ -87,18 +87,20 @@ def _quaternion_to_axis_angle(quaternions):
     return quaternions[..., 1:] / sin_half_angles_over_angles
  
  
-def convert_hymotion_to_smplx52(rot6d, transl):
-    """Convert HY-Motion output to SMPL-X 52-joint axis-angle format.
-
-    Preserves all 52 joints (22 body + 15 left hand + 15 right hand) when
-    available, or pads with identity rotations for hands if only 22 body joints.
-
+def convert_hymotion_to_smpl24(rot6d, transl):
+    """Convert HY-Motion output (SMPL-H 22-joint rot6d) to standard SMPL 24-joint axis-angle.
+ 
+    HY-Motion outputs 22 body joints in rot6d format (same ordering as SMPL body joints 0-21).
+    Standard SMPL expects 24 joints: joints 0-21 (body) + joint 22 (L_Hand) + joint 23 (R_Hand).
+ 
+    We map joints 0-21 directly and set joints 22-23 (hand roots) to identity rotation.
+ 
     Args:
-        rot6d: (num_frames, num_joints, 6) - HY-Motion rot6d output, 22 or 52 joints
+        rot6d: (num_frames, num_joints, 6) - HY-Motion rot6d output, num_joints is 22 or 52
         transl: (num_frames, 3) - root translation
-
+ 
     Returns:
-        pose: (num_frames, 156) - SMPL-X axis-angle pose (52 joints x 3)
+        pose: (num_frames, 72) - standard SMPL axis-angle pose (24 joints x 3)
         shape: (10,) - zero body shape
         root_translation: (num_frames, 3) - root translation
     """
@@ -106,42 +108,33 @@ def convert_hymotion_to_smplx52(rot6d, transl):
         rot6d = torch.from_numpy(rot6d).float()
     if isinstance(transl, np.ndarray):
         transl = torch.from_numpy(transl).float()
-
+ 
     num_frames = rot6d.shape[0]
-    num_input_joints = rot6d.shape[1]
-
-    if num_input_joints >= 52:
-        # Full SMPL-H/SMPL-X: preserve all 52 joints including fingers
-        all_rot6d = rot6d[:, :52, :]
-    elif num_input_joints >= 22:
-        # Only body joints: pad hand joints with identity rotation
-        body_rot6d = rot6d[:, :22, :]
-        identity_6d = torch.zeros(num_frames, 30, 6, dtype=rot6d.dtype, device=rot6d.device)
-        identity_6d[..., 0] = 1.0
-        identity_6d[..., 4] = 1.0
-        all_rot6d = torch.cat([body_rot6d, identity_6d], dim=1)
-    else:
-        raise ValueError(f"Expected >= 22 joints, got {num_input_joints}")
-
-    # Convert all 52 joints: 6D -> rotation matrix -> axis-angle
-    rot_matrices = _rot6d_to_rotation_matrix(all_rot6d)  # (N, 52, 3, 3)
-    all_aa = _matrix_to_axis_angle(rot_matrices)  # (N, 52, 3)
-
-    pose = all_aa.reshape(num_frames, -1).cpu().numpy()  # (N, 156)
+ 
+    # Take only the first 22 body joints (discard hand finger joints if present)
+    body_rot6d = rot6d[:, :22, :]  # (num_frames, 22, 6)
+ 
+    # Convert 6D rotation to rotation matrix, then to axis-angle
+    rot_matrices = _rot6d_to_rotation_matrix(body_rot6d)  # (num_frames, 22, 3, 3)
+    body_aa = _matrix_to_axis_angle(rot_matrices)  # (num_frames, 22, 3)
+ 
+    # Create identity rotation (zero axis-angle) for hand root joints (L_Hand=22, R_Hand=23)
+    hand_aa = torch.zeros(num_frames, 2, 3, dtype=body_aa.dtype, device=body_aa.device)
+ 
+    # Concatenate: 22 body joints + 2 hand joints = 24 SMPL joints
+    smpl_aa = torch.cat([body_aa, hand_aa], dim=1)  # (num_frames, 24, 3)
+ 
+    # Flatten to (num_frames, 72)
+    pose = smpl_aa.reshape(num_frames, -1).cpu().numpy()
     shape = np.zeros(10)
     root_translation = transl.cpu().numpy()
-
-    print(f'[RFGen.ObjDiff] {num_input_joints} input joints -> 52 SMPL-X joints (156D)')
+ 
     return pose, shape, root_translation
-
-
-# Backward-compatible alias
-convert_hymotion_to_smpl24 = convert_hymotion_to_smplx52
  
  
 def generate(prompt, out_dir, hymotion_output=None):
-    """Generate motion from text prompt and save as SMPL-X 52-joint format.
-
+    """Generate motion from text prompt using HY-Motion and save as SMPL 24-joint format.
+ 
     Args:
         prompt: text description of the motion
         out_dir: output directory to save obj_diff.npz
@@ -149,25 +142,27 @@ def generate(prompt, out_dir, hymotion_output=None):
                          If None, will attempt to use MDM fallback.
     """
     if hymotion_output is not None:
-        print(colored('[RFGen.ObjDiff]: Converting HY-Motion output to SMPL-X 52-joint format.', 'green'))
-
+        # Use HY-Motion output directly
+        print(colored('[RFGen.ObjDiff]: Converting HY-Motion output to SMPL-24 format.', 'green'))
+ 
         rot6d = hymotion_output['rot6d']
         transl = hymotion_output['transl']
-
+ 
+        # Handle batch dimension: take first sample if batched
         if rot6d.ndim == 4:
-            rot6d = rot6d[0]
-            transl = transl[0]
-
-        pose, shape, root_translation = convert_hymotion_to_smplx52(rot6d, transl)
-
+            rot6d = rot6d[0]    # (L, J, 6)
+            transl = transl[0]  # (L, 3)
+ 
+        pose, shape, root_translation = convert_hymotion_to_smpl24(rot6d, transl)
+ 
         np.savez(
             os.path.join(out_dir, 'obj_diff.npz'),
             pose=pose,
             shape=shape,
             root_translation=root_translation,
-            gender="neutral",
+            gender="male",
         )
-        print(colored(f'[RFGen.ObjDiff]: Saved obj_diff.npz with pose shape {pose.shape} (52 joints)', 'green'))
+        print(colored(f'[RFGen.ObjDiff]: Saved obj_diff.npz with pose shape {pose.shape}', 'green'))
     else:
         # Fallback: use original MDM pipeline
         print(colored('[RFGen.ObjDiff]: No HY-Motion output provided, using MDM fallback.', 'yellow'))
