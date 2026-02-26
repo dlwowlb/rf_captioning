@@ -3,8 +3,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import json
 
-def FSPL(distance, frequency=77e9):
-    wavelength = 3e8 / frequency
+def FSPL(distance, fc_hz=77e9):
+    """Free Space Path Loss.
+    
+    Args:
+        distance: path length (meters)
+        fc_hz: carrier frequency in Hz (default 77GHz)
+    """
+    wavelength = 3e8 / fc_hz
     return (wavelength / (4 * 3.14159265358979323846 * distance)) ** 2
 
 def dechirp(x,xref):
@@ -24,7 +30,6 @@ class Radar:
 
         self.num_tx = config["num_tx"]
         self.num_rx = config["num_rx"]
-        self.fc = config["fc"]
         self.slope = config["slope"]
         self.adc_samples = config["adc_samples"]
         self.adc_start_time = config["adc_start_time"]
@@ -38,30 +43,40 @@ class Radar:
         self.num_angle_bins = config["num_angle_bins"]
         self.power = config["power"]
 
-        antenna_spacing = self.c0/self.fc/2
+        # ============================================================
+        # FIX: Normalize fc to Hz internally, regardless of config unit
+        # TI configs typically use GHz (e.g. fc=77)
+        # Some configs may use Hz (e.g. fc=77e9)
+        # ============================================================
+        fc_raw = config["fc"]
+        if fc_raw < 1e6:       # GHz (e.g. 77)
+            self.fc_hz = fc_raw * 1e9
+        else:                   # already Hz (e.g. 77e9)
+            self.fc_hz = fc_raw
+
+        self._lambda = self.c0 / self.fc_hz
+        antenna_spacing = self._lambda / 2   # correct: ~1.95mm for 77GHz
+
         self.tx_loc = np.array(config["tx_loc"],dtype = np.float32)*antenna_spacing
         self.rx_loc = np.array(config["rx_loc"],dtype = np.float32)*antenna_spacing
 
         self.tx_pos = torch.tensor(self.tx_loc)
         self.rx_pos = torch.tensor(self.rx_loc)
 
+        # slope is in MHz/μs -> Hz/s = slope * 1e12
+        # sample_rate is in ksps -> sps = sample_rate * 1e3
+        # idle_time, ramp_end_time in μs
+        self.range_resolution = (self.c0 * self.sample_rate * 1e3) / (2 * self.slope * 1e12 * self.adc_samples)
+        self.max_range = (self.c0 * self.sample_rate * 1e3) / (2 * self.slope * 1e12) / 2
 
-        # Here is an example of how to generate the tx and rx locations, you can usually find them on the user manual of the radar.
-        # self.tx_loc = np.array([[0,0,0],[4*spacing,0,0],[2*spacing,spacing,0]])
-        # self.rx_loc = np.array([[-6*spacing,0,0],[-5*spacing,0,0],[-4*spacing,0,0],[-3*spacing,0,0]])
-
-        self.range_resolution = (3e8 * self.sample_rate * 1e3) / (2 * self.slope * 1e12 * self.adc_samples)
-        self.max_range = (300 * self.sample_rate) / (2 * self.slope * 1e3)
-        self.doppler_resolution = 3e8 / (2 * self.fc * 1e9 * (self.idle_time + self.ramp_end_time) * 1e-6 * self.num_doppler_bins * self.num_tx)
-        self.max_doppler = 3e8 / (4 * self.fc * 1e9 * (self.idle_time + self.ramp_end_time) * 1e-6 * self.num_tx)
-       
-        self._lambda = self.c0/self.fc
-
+        chirp_period_s = (self.idle_time + self.ramp_end_time) * 1e-6
+        self.doppler_resolution = self.c0 / (2 * self.fc_hz * chirp_period_s * self.num_doppler_bins * self.num_tx)
+        self.max_doppler = self.c0 / (4 * self.fc_hz * chirp_period_s * self.num_tx)
 
     
     def waveform(self,t,phi=0): 
-        
-        fc = (self.fc * t + 0.5 * (self.slope * 1e6* 1e6) *  t * t )
+        # FIX: use self.fc_hz (Hz) consistently
+        fc = (self.fc_hz * t + 0.5 * (self.slope * 1e12) *  t * t )
         yI = torch.cos( 2 * torch.pi * fc +phi)
         yQ = torch.sin( 2 * torch.pi  * fc +phi)
         y =  yI+yQ*1j
@@ -69,8 +84,8 @@ class Radar:
 
     def chirp(self,distance,intensity):
         t_sample = torch.arange(0,self.adc_samples,dtype=torch.float64)/(self.sample_rate*1e3) +self.adc_start_time*1e-6
-        # loss = RF_path_loss_torch(tof).view(-1,1)
-        loss = FSPL(distance).view(-1,1)
+        # FIX: pass fc_hz to FSPL instead of hardcoded 77e9
+        loss = FSPL(distance, fc_hz=self.fc_hz).view(-1,1)
         intensity = intensity.view(-1,1)
         tof = distance / self.c0
         
@@ -89,7 +104,7 @@ class Radar:
         origin_offset = torch.zeros(3, dtype=self.tx_pos.dtype, device=self.tx_pos.device)
         if sensor_origin is not None:
             origin_offset = torch.tensor(sensor_origin, dtype=self.tx_pos.dtype, device=self.tx_pos.device)
- 
+
         
         for chirp_id in range(self.chirp_per_frame):
             time_in_frame = chirp_id / self.chirp_per_frame / self.frame_per_second
