@@ -14,7 +14,8 @@
 
 !/examples/
 
-
+# RadarLLM baseline
+!/radar_llm/
 
 # Radar Captioning Pipeline
 #!/radar_captioning/
