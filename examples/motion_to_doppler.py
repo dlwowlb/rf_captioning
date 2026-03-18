@@ -10,8 +10,8 @@ This example demonstrates:
  
 Usage:
     python examples/motion_to_doppler.py \
-        --prompt "a person walking forward" \
-        --duration 3.0 \
+        --prompt "A person sat, extended both arms to the sides, and then brought them back down." \
+        --duration 4.0 \
         --output-dir output/test
 """
  
