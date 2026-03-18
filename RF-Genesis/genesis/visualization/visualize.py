@@ -86,7 +86,7 @@ def draw_skeleton(joints3D, kintree_table, ax=None, with_numbers=False):
 def draw_smpl_on_axis(pose,shape,translation=None, ax=None):
     pose = torch.tensor(pose).unsqueeze(0)
     shape = torch.tensor(shape).unsqueeze(0)
-    smpl_layer = SMPL_Layer(center_idx=0,gender='male',model_root='D:/ECCV/RF_Captioning/RF-Genesis/models/smpl_models')
+    smpl_layer = SMPL_Layer(center_idx=0,gender='male',model_root='/home/minkook/dlwowlb/rf_captioning/RF-Genesis/models/smpl_models')
     verts, Jtr = smpl_layer(pose.float(), th_betas=shape.float())
 
     display_smpl(

@@ -6,7 +6,7 @@
 #tqdm
 #termcolor
 mitsuba==3.5.2
-#smplpytorch
+smplpytorch
 #diffusers
 #transformers
 #scipy
