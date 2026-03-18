@@ -26,7 +26,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from models.aggregate_vqvae import AggregateVQVAE
-from models.motion_encoder import build_motion_encoder
+from rf_captioning.models.motion_encoder_HYLatent import build_motion_encoder
 from models.language_model import RadarAwareLanguageModel
 
 

@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 """
-RadarLLM 학습 스크립트
-====================
+RadarLLM 학습 스크립트 — MotionGPT Pretrained 통합
+===================================================
 
 파이프라인 (3단계):
-  Stage 1: VQ-VAE + MotionEncoder 학습 (100 epochs)
-           MotionEncoder: HY-Motion latent(201D) → Transformer(2L) → F_mot(512D)
-           VQ-VAE와 MotionEncoder가 함께 학습됨
+  Stage 1: VQ-VAE + MotionEncoder(T2M-GPT) 학습 (100 epochs)
+           MotionEncoder: HumanML3D(263D) → T2M-GPT Conv1D+ResBlock → F_mot(512D)
+           Pretrained weights 로드 후 fine-tune 또는 freeze
            L_VQ = L_rec + L_emb + L_commit
 
   Stage 2: T5 Pre-training (300 epochs)
            L_pretrain = λ1·L_pred + λ2·L_r2t + λ3·L_t2r
 
   Stage 3: Instruction Tuning (100 epochs)
-           + 테스트 캡셔닝
 
 사용법:
-  python scripts/train_v2.py --stage all --config configs/default.yaml
+  python scripts/train_RadarLLM.py --stage all --config configs/default.yaml
+  python scripts/train_RadarLLM.py --stage tokenizer --config configs/default.yaml
 """
 
 import os
@@ -41,32 +41,45 @@ from models.language_model import RadarAwareLanguageModel
 
 
 # ============================================================
-# 데이터셋
+# Dataset
 # ============================================================
 
 class RadarMotionTextDataset(Dataset):
     """
-    generate_pt_v2.py가 생성한 데이터 로드.
+    generate_pt.py + add_humanml3d.py가 생성한 데이터 로드.
 
     각 .npz:
-      - point_cloud:    (T_radar, 128, 6)
-      - text:           str
-      - motion_latent:  (T_motion, 201) ← HY-Motion latent (★ 핵심)
-      - motion_joints:  (T_motion, 22, 3)  (fallback)
-      - motion_rot6d:   (T_motion, 22, 6)  (fallback)
+      - point_cloud:       (T_radar, 128, 6)
+      - text:              str
+      - motion_humanml3d:  (T_motion, 263)  ★ MotionGPT용
+      - motion_latent:     (T_motion, 201)  (fallback)
+      - motion_joints:     (T_motion, 22, 3)
+      - motion_rot6d:      (T_motion, 22, 6)
+      - motion_transl:     (T_motion, 3)
     """
 
     def __init__(self, data_dir, max_radar_frames=100, max_motion_frames=300,
-                 points_per_frame=128, motion_input_type="latent"):
+                 points_per_frame=128, motion_input_type="humanml3d"):
         super().__init__()
         self.data_dir = data_dir
         self.max_radar_frames = max_radar_frames
         self.max_motion_frames = max_motion_frames
         self.points_per_frame = points_per_frame
         self.motion_input_type = motion_input_type
+
         self.samples = sorted(Path(data_dir).glob("*.npz"))
         print(f"[Dataset] {len(self.samples)} samples from {data_dir}, "
               f"motion_type={motion_input_type}")
+
+        # 첫 샘플로 motion_humanml3d 존재 여부 확인
+        if len(self.samples) > 0:
+            first = np.load(self.samples[0], allow_pickle=True)
+            available = [k for k in first.files if k.startswith("motion_")]
+            print(f"[Dataset] Available motion keys: {available}")
+            if motion_input_type == "humanml3d" and "motion_humanml3d" not in first:
+                print(f"[Dataset] ⚠ motion_humanml3d not found! "
+                      f"Run: python scripts/add_humanml3d.py --data_dir {data_dir}")
+                print(f"[Dataset]   Falling back to available keys")
 
     def __len__(self):
         return len(self.samples)
@@ -78,27 +91,48 @@ class RadarMotionTextDataset(Dataset):
         pc = data["point_cloud"].astype(np.float32)
         T_r = min(pc.shape[0], self.max_radar_frames)
         pc = pc[:T_r]
-        pc_4d = np.zeros((self.max_radar_frames, self.points_per_frame, 4), dtype=np.float32)
+        pc_4d = np.zeros((self.max_radar_frames, self.points_per_frame, 4),
+                         dtype=np.float32)
         pc_4d[:T_r, :, :3] = pc[:, :, :3]
         pc_4d[:T_r, :, 3] = pc[:, :, 3]
         radar_mask = np.zeros(self.max_radar_frames, dtype=np.float32)
         radar_mask[:T_r] = 1.0
 
-        # ── 모션 데이터 (우선순위: latent > joints > rot6d) ──
-        motion_key = f"motion_{self.motion_input_type}"
+        # ── 모션 데이터 (우선순위: config → humanml3d → latent → joints → rot6d) ──
         motion = None
-        for key in [motion_key, "motion_latent", "motion_joints", "motion_rot6d"]:
-            if key in data:
-                motion = data[key].astype(np.float32)
-                break
 
+        # key 매핑: input_type → npz key
+        type_to_key = {
+            "humanml3d": "motion_humanml3d",
+            "latent":    "motion_latent",
+            "joints":    "motion_joints",
+            "rot6d":     "motion_rot6d",
+        }
+
+        # 1. config 지정 타입 먼저
+        preferred_key = type_to_key.get(self.motion_input_type)
+        if preferred_key and preferred_key in data:
+            motion = data[preferred_key].astype(np.float32)
+
+        # 2. fallback 순서
         if motion is None:
-            motion = np.zeros((1, 201), dtype=np.float32)
+            for key in ["motion_humanml3d", "motion_latent",
+                        "motion_joints", "motion_rot6d"]:
+                if key in data:
+                    motion = data[key].astype(np.float32)
+                    break
 
-        # joints/rot6d가 (T, J, D) 형태면 flatten → (T, J*D)
+        # 3. 빈 데이터 fallback
+        if motion is None:
+            # input_dim에 맞게 빈 데이터 생성
+            dim_map = {"humanml3d": 263, "latent": 201, "joints": 66, "rot6d": 132}
+            dim = dim_map.get(self.motion_input_type, 263)
+            motion = np.zeros((1, dim), dtype=np.float32)
+
+        # (T, J, D) → flatten to (T, J*D)
         if motion.ndim == 3:
             T_m, J, D = motion.shape
-            if J > 22:  # 52 joints → 22 body only
+            if J > 22:
                 motion = motion[:, :22, :]
             motion = motion.reshape(T_m, -1)
 
@@ -107,7 +141,8 @@ class RadarMotionTextDataset(Dataset):
 
         # 패딩
         motion_dim = motion.shape[-1]
-        motion_padded = np.zeros((self.max_motion_frames, motion_dim), dtype=np.float32)
+        motion_padded = np.zeros((self.max_motion_frames, motion_dim),
+                                 dtype=np.float32)
         motion_padded[:T_m] = motion
         motion_mask = np.zeros(self.max_motion_frames, dtype=np.float32)
         motion_mask[:T_m] = 1.0
@@ -117,7 +152,7 @@ class RadarMotionTextDataset(Dataset):
         return {
             "point_cloud": torch.from_numpy(pc_4d),
             "radar_mask": torch.from_numpy(radar_mask),
-            "motion": torch.from_numpy(motion_padded),       # (max_T_m, D)
+            "motion": torch.from_numpy(motion_padded),
             "motion_mask": torch.from_numpy(motion_mask),
             "text": text,
             "num_radar_frames": T_r,
@@ -138,7 +173,7 @@ def collate_fn(batch):
 
 
 # ============================================================
-# 테스트 캡셔닝 (학습 중 호출)
+# Test Captioning (학습 중 호출)
 # ============================================================
 
 @torch.no_grad()
@@ -195,44 +230,58 @@ def save_test_results(vqvae, lm, test_loader, device, output_dir, prompt):
 
 
 # ============================================================
-# Stage 1: VQ-VAE + MotionEncoder 동시 학습
+# Stage 1: VQ-VAE + MotionEncoder(T2M-GPT) 학습
 # ============================================================
 
 def train_tokenizer(config, args):
     """
-    Aggregate VQ-VAE + MotionEncoder 동시 학습.
+    Aggregate VQ-VAE + T2M-GPT MotionEncoder 학습.
 
-    MotionEncoder: HY-Motion latent(201D) → Transformer(2L) → F_mot(512D)
-    VQ-VAE와 함께 학습됨.
-
-    L_VQ = L_rec + L_emb + L_commit
+    MotionEncoder에 pretrained weight가 로드된 경우:
+      - freeze=true:  MotionEncoder 고정, VQ-VAE만 학습
+      - freeze=false: 둘 다 fine-tune
     """
-    print("\n" + "="*60) 
-    print("Stage 1: VQ-VAE + MotionEncoder 학습")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print("Stage 1: VQ-VAE + MotionEncoder(T2M-GPT) 학습")
+    print("=" * 60)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     tok_cfg = config["tokenizer"]
+    me_cfg = config.get("motion_encoder", {})
 
-    # VQ-VAE
+    # ── VQ-VAE ──
     vqvae = AggregateVQVAE(config).to(device)
     print(f"VQ-VAE params: {sum(p.numel() for p in vqvae.parameters()):,}")
 
-    # MotionEncoder (VQ-VAE와 함께 학습)
+    # ── MotionEncoder (T2M-GPT, pretrained 자동 로드) ──
     motion_enc = build_motion_encoder(config).to(device)
 
-    # 둘 다 학습
-    all_params = list(vqvae.parameters()) + list(motion_enc.parameters())
-    optimizer = optim.AdamW(all_params, lr=tok_cfg["lr"],
+    # ── Optimizer: trainable params만 ──
+    trainable_params = [p for p in vqvae.parameters() if p.requires_grad]
+    trainable_params += [p for p in motion_enc.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=tok_cfg["lr"],
                             weight_decay=tok_cfg.get("weight_decay", 1e-2))
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=tok_cfg["epochs"])
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=tok_cfg["epochs"])
 
-    # Data
-    mi_type = config.get("motion_encoder", {}).get("input_type", "latent")
-    train_ds = RadarMotionTextDataset(config["dataset"]["train_dir"],
-                                       motion_input_type=mi_type)
-    val_ds = RadarMotionTextDataset(config["dataset"]["val_dir"],
-                                     motion_input_type=mi_type)
+    # ── Data ──
+    mi_type = me_cfg.get("input_type", "humanml3d")
+    ds_cfg = config.get("dataset", {})
+
+    train_ds = RadarMotionTextDataset(
+        ds_cfg["train_dir"],
+        max_radar_frames=ds_cfg.get("max_seq_len", 100),
+        max_motion_frames=ds_cfg.get("max_motion_frames", 300),
+        points_per_frame=ds_cfg.get("points_per_frame", 128),
+        motion_input_type=mi_type,
+    )
+    val_ds = RadarMotionTextDataset(
+        ds_cfg["val_dir"],
+        max_radar_frames=ds_cfg.get("max_seq_len", 100),
+        max_motion_frames=ds_cfg.get("max_motion_frames", 300),
+        points_per_frame=ds_cfg.get("points_per_frame", 128),
+        motion_input_type=mi_type,
+    )
     train_loader = DataLoader(train_ds, batch_size=tok_cfg["batch_size"],
                               shuffle=True, collate_fn=collate_fn, num_workers=4)
     val_loader = DataLoader(val_ds, batch_size=tok_cfg["batch_size"],
@@ -241,27 +290,11 @@ def train_tokenizer(config, args):
     os.makedirs(args.output_dir, exist_ok=True)
     best_val = float("inf")
 
-    '''
-    with torch.no_grad():
-        first_batch = next(iter(train_loader))
-        pc_init = first_batch["point_cloud"].to(device)
-        enc_out = vqvae.encoder(pc_init)
-        F_group = enc_out["F_group"]
-        F_all, _, _ = vqvae.masked_agg(F_group, training=False)
-        z_e = vqvae.anchor_pool(F_all)
-        flat = z_e.reshape(-1, z_e.shape[-1])
-        n_codes = vqvae.quantizer.codebook_size
-        if flat.shape[0] >= n_codes:
-            idx = torch.randperm(flat.shape[0])[:n_codes]
-        else:
-            idx = torch.randint(0, flat.shape[0], (n_codes,))
-        vqvae.quantizer.codebook.weight.data.copy_(flat[idx])
-        print(f"Codebook 초기화 완료: z_e {flat.shape[0]}개에서 {n_codes}개 코드 설정")
-    '''
+    # ── Codebook 초기화 (data-driven) ──
     with torch.no_grad():
         all_z_e = []
         for i, batch in enumerate(train_loader):
-            if i >= 10:  # 10배치 = ~40개 샘플
+            if i >= 10:
                 break
             pc_init = batch["point_cloud"].to(device)
             enc_out = vqvae.encoder(pc_init)
@@ -269,15 +302,18 @@ def train_tokenizer(config, args):
             F_all, _, _ = vqvae.masked_agg(F_group, training=False)
             z_e = vqvae.anchor_pool(F_all)
             all_z_e.append(z_e.reshape(-1, z_e.shape[-1]))
-        
         flat = torch.cat(all_z_e, dim=0)
         n_codes = vqvae.quantizer.codebook_size
-        idx = torch.randperm(flat.shape[0])[:n_codes]
+        if flat.shape[0] >= n_codes:
+            idx = torch.randperm(flat.shape[0])[:n_codes]
+        else:
+            idx = torch.randint(0, flat.shape[0], (n_codes,))
         vqvae.quantizer.codebook.weight.data.copy_(flat[idx])
-        #print(f"Codebook 초기화 완료: z_e {flat.shape[0]}개에서 {n_codes}개 코드 설정")
+        vqvae.quantizer.codebook.weight.data += torch.randn_like(vqvae.quantizer.codebook.weight.data) * 0.1
+        print(f"Codebook initialized with noise perturbation")
 
 
-
+    # ── Training loop ──
     for epoch in range(tok_cfg["epochs"]):
         vqvae.train()
         motion_enc.train()
@@ -291,14 +327,14 @@ def train_tokenizer(config, args):
             T_radar = pc.shape[1]
             L_radar = vqvae.encoder.get_output_length(T_radar)
 
-            # MotionEncoder: latent(201D) → Transformer → F_mot(512D)
+            # MotionEncoder: (B, T_m, 263) → (B, L_radar, 512)
             F_mot = motion_enc(motion, target_length=L_radar)
 
             outputs = vqvae(pc, motion_features=F_mot)
 
             optimizer.zero_grad()
             outputs["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
             optimizer.step()
 
             for k in ["total", "rec", "emb", "commit"]:
@@ -310,60 +346,16 @@ def train_tokenizer(config, args):
 
         scheduler.step()
 
+        # ── Diagnostics ──
         if (epoch + 1) % 2 == 0:
-                 with torch.no_grad():
-                    # 진단 코드 전체
-                    indices, _ = vqvae.encode(pc)
-                    unique = indices.unique()
-                    print(f"  [VQ 상태] epoch {epoch+1}")
-                    print(f"  unique tokens: {len(unique)}/{vqvae.quantizer.codebook_size}")
+            with torch.no_grad():
+                indices, _ = vqvae.encode(pc)
+                unique = indices.unique()
+                print(f"  [Diag] epoch {epoch+1}: "
+                      f"unique_tokens={len(unique)}/{vqvae.quantizer.codebook_size}, "
+                      f"z_e_std={vqvae.anchor_pool(vqvae.masked_agg(vqvae.encoder(pc)['F_group'], training=False)[0]).std().item():.4f}")
 
-                    F_mot = motion_enc(motion, target_length=L_radar)
-                    print(f"  F_mot std: {F_mot.std().item():.4f}")
-                    print(f"  F_mot 샘플간 차이: {(F_mot[0] - F_mot[-1]).abs().mean().item():.4f}")
-
-
-
-                    # 2. z_e 다양성
-                    enc_out = vqvae.encoder(pc)
-                    F_group = enc_out["F_group"]
-                    F_all, _, _ = vqvae.masked_agg(F_group, training=False)
-                    z_e = vqvae.anchor_pool(F_all)
-                    
-                    print(f"  z_e std: {z_e.std().item():.4f}")
-                    print(f"  z_e 샘플간 차이: {(z_e[0] - z_e[-1]).abs().mean().item():.4f}")
-                    print(f"  F_group 샘플간 차이: {(F_group[0] - F_group[-1]).abs().mean().item():.4f}")
-
-                    # 3. centered 좌표 + anchor 활성화
-                    xyz_c = enc_out["xyz_centered"]
-                    anchors = vqvae.encoder.grouping.anchors
-                    radius = vqvae.encoder.grouping.radius
-
-                    pts = xyz_c[0, 0]
-                    valid = pts.norm(dim=-1) > 1e-6
-                    pts_v = pts[valid]
-                    if pts_v.shape[0] > 0:
-                        print(f"  centered 범위: x[{pts_v[:,0].min():.2f},{pts_v[:,0].max():.2f}] "
-                            f"y[{pts_v[:,1].min():.2f},{pts_v[:,1].max():.2f}] "
-                            f"z[{pts_v[:,2].min():.2f},{pts_v[:,2].max():.2f}]")
-                    else:
-                        print(f"  centered 범위: 유효점 없음 (빈 프레임)")
-
-                    dist = torch.cdist(anchors.unsqueeze(0), pts_v.unsqueeze(0))[0]
-                    hits = (dist < radius).sum(dim=1)
-                    print(f"  활성 anchor: {(hits > 0).sum().item()}/{anchors.shape[0]}")
-
-                    # 4. 샘플별 활성 anchor 비교
-                    for b in range(min(4, pc.shape[0])):
-                        pts = xyz_c[b, 0]
-                        valid = pts.norm(dim=-1) > 1e-6
-                        pts_v = pts[valid]
-                        dist = torch.cdist(anchors.unsqueeze(0), pts_v.unsqueeze(0))[0]
-                        hits = (dist < radius).sum(dim=1)
-                        print(f"  샘플{b}: 활성 {(hits > 0).sum().item()}/64, 유효점 {valid.sum().item()}")
-
-
-        # Validation
+        # ── Validation ──
         vqvae.eval()
         motion_enc.eval()
         val_loss = 0
@@ -388,54 +380,72 @@ def train_tokenizer(config, args):
                 "vqvae_state_dict": vqvae.state_dict(),
                 "motion_enc_state_dict": motion_enc.state_dict(),
                 "val_loss": val_loss,
-            }, os.path.join(args.output_dir, "tokenizer_final.pt"))
+            }, os.path.join(args.output_dir, "tokenizer_best.pt"))
 
     torch.save({
         "vqvae_state_dict": vqvae.state_dict(),
         "motion_enc_state_dict": motion_enc.state_dict(),
     }, os.path.join(args.output_dir, "tokenizer_final.pt"))
+    print(f"Saved: tokenizer_best.pt, tokenizer_final.pt")
     return vqvae
 
 
 # ============================================================
-# Stage 2: LM Pre-training + 테스트 캡셔닝
+# Stage 2: LM Pre-training
 # ============================================================
 
 def pretrain_lm(config, args, vqvae=None):
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Stage 2: LM Pre-training")
-    print("="*60)
+    print("=" * 60)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     lm_cfg = config["language_model"]
     pt_cfg = lm_cfg["pretrain"]
 
-    # Frozen VQ-VAE
+    # ── Frozen VQ-VAE ──
     if vqvae is None:
         vqvae = AggregateVQVAE(config).to(device)
-        ckpt_path = args.tokenizer_ckpt or os.path.join(args.output_dir, "tokenizer_best.pt")
-        ckpt = torch.load(ckpt_path, map_location=device)
-        vqvae.load_state_dict(ckpt.get("vqvae_state_dict", ckpt.get("model_state_dict", ckpt)))
-        print(f"VQ-VAE loaded from {ckpt_path}")
+        ckpt_path = args.tokenizer_ckpt or os.path.join(
+            args.output_dir, "tokenizer_best.pt")
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            vqvae.load_state_dict(
+                ckpt.get("vqvae_state_dict",
+                         ckpt.get("model_state_dict", ckpt)))
+            print(f"VQ-VAE loaded from {ckpt_path}")
+        else:
+            print(f"⚠ VQ-VAE checkpoint not found: {ckpt_path}")
     vqvae.eval()
     for p in vqvae.parameters():
         p.requires_grad = False
 
-    # LM
+    # ── LM ──
     lm = RadarAwareLanguageModel(config).to(device)
     print(f"LM params: {sum(p.numel() for p in lm.parameters()):,}")
 
-    mi_type = config.get("motion_encoder", {}).get("input_type", "latent")
-    train_ds = RadarMotionTextDataset(config["dataset"]["train_dir"],
-                                       motion_input_type=mi_type)
+    # ── Data ──
+    me_cfg = config.get("motion_encoder", {})
+    mi_type = me_cfg.get("input_type", "humanml3d")
+    ds_cfg = config.get("dataset", {})
+
+    train_ds = RadarMotionTextDataset(
+        ds_cfg["train_dir"], motion_input_type=mi_type,
+        max_radar_frames=ds_cfg.get("max_seq_len", 100),
+        max_motion_frames=ds_cfg.get("max_motion_frames", 300),
+    )
     train_loader = DataLoader(train_ds, batch_size=pt_cfg["batch_size"],
                               shuffle=True, collate_fn=collate_fn, num_workers=4)
 
     # Test loader
-    test_dir = config["dataset"].get("test_dir", config["dataset"].get("val_dir"))
+    test_dir = ds_cfg.get("test_dir", ds_cfg.get("val_dir"))
     test_loader = None
     if test_dir and os.path.isdir(test_dir):
-        test_ds = RadarMotionTextDataset(test_dir, motion_input_type=mi_type)
+        test_ds = RadarMotionTextDataset(
+            test_dir, motion_input_type=mi_type,
+            max_radar_frames=ds_cfg.get("max_seq_len", 100),
+            max_motion_frames=ds_cfg.get("max_motion_frames", 300),
+        )
         test_loader = DataLoader(test_ds, batch_size=4, shuffle=False,
                                  collate_fn=collate_fn, num_workers=2)
 
@@ -455,7 +465,9 @@ def pretrain_lm(config, args, vqvae=None):
             with torch.no_grad():
                 indices, _ = vqvae.encode(pc)
 
-            outputs = lm.pretrain_step(indices, text_enc.input_ids, text_enc.attention_mask)
+            outputs = lm.pretrain_step(
+                indices, text_enc.input_ids, text_enc.attention_mask)
+
             optimizer.zero_grad()
             outputs["loss"].backward()
             torch.nn.utils.clip_grad_norm_(lm.parameters(), 1.0)
@@ -465,7 +477,6 @@ def pretrain_lm(config, args, vqvae=None):
         avg = epoch_loss / max(len(train_loader), 1)
         print(f"  Epoch {epoch+1}: loss={avg:.4f}")
 
-        # 테스트 캡셔닝
         if test_loader and (epoch + 1) % caption_every == 0:
             run_test_captioning(vqvae, lm, test_loader, device, epoch + 1)
 
@@ -474,123 +485,101 @@ def pretrain_lm(config, args, vqvae=None):
             torch.save({"epoch": epoch, "model_state_dict": lm.state_dict()},
                        os.path.join(args.output_dir, "lm_pretrain_best.pt"))
 
+    torch.save({"model_state_dict": lm.state_dict()},
+               os.path.join(args.output_dir, "lm_pretrain_final.pt"))
     return lm
 
 
 # ============================================================
-# Stage 3: Instruction Tuning + 테스트 캡셔닝
+# Stage 3: Instruction Tuning
 # ============================================================
 
 def finetune_lm(config, args, vqvae=None, lm=None):
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Stage 3: Instruction Tuning")
-    print("="*60)
+    print("=" * 60)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     ft_cfg = config["language_model"]["finetune"]
 
-    # Frozen VQ-VAE
+    # ── Frozen VQ-VAE ──
     if vqvae is None:
         vqvae = AggregateVQVAE(config).to(device)
-        ckpt_path = args.tokenizer_ckpt or os.path.join(args.output_dir, "tokenizer_best.pt")
-        ckpt = torch.load(ckpt_path, map_location=device)
-        vqvae.load_state_dict(ckpt.get("vqvae_state_dict", ckpt.get("model_state_dict", ckpt)))
+        ckpt_path = args.tokenizer_ckpt or os.path.join(
+            args.output_dir, "tokenizer_best.pt")
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            vqvae.load_state_dict(
+                ckpt.get("vqvae_state_dict",
+                         ckpt.get("model_state_dict", ckpt)))
     vqvae.eval()
     for p in vqvae.parameters():
         p.requires_grad = False
 
-    # LM
+    # ── LM ──
     if lm is None:
         lm = RadarAwareLanguageModel(config).to(device)
-        ckpt_path = args.lm_ckpt or os.path.join(args.output_dir, "lm_pretrain_best.pt")
+        ckpt_path = args.lm_ckpt or os.path.join(
+            args.output_dir, "lm_pretrain_best.pt")
         if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             lm.load_state_dict(ckpt.get("model_state_dict", ckpt))
             print(f"LM loaded from {ckpt_path}")
 
-    mi_type = config.get("motion_encoder", {}).get("input_type", "latent")
-    train_ds = RadarMotionTextDataset(config["dataset"]["train_dir"],
-                                       motion_input_type=mi_type)
+    # ── Data ──
+    me_cfg = config.get("motion_encoder", {})
+    mi_type = me_cfg.get("input_type", "humanml3d")
+    ds_cfg = config.get("dataset", {})
+
+    train_ds = RadarMotionTextDataset(
+        ds_cfg["train_dir"], motion_input_type=mi_type,
+        max_radar_frames=ds_cfg.get("max_seq_len", 100),
+        max_motion_frames=ds_cfg.get("max_motion_frames", 300),
+    )
     train_loader = DataLoader(train_ds, batch_size=ft_cfg["batch_size"],
                               shuffle=True, collate_fn=collate_fn, num_workers=4)
 
     # Test loader
-    test_dir = config["dataset"].get("test_dir", config["dataset"].get("val_dir"))
+    test_dir = ds_cfg.get("test_dir", ds_cfg.get("val_dir"))
     test_loader = None
     if test_dir and os.path.isdir(test_dir):
-        test_ds = RadarMotionTextDataset(test_dir, motion_input_type=mi_type)
+        test_ds = RadarMotionTextDataset(
+            test_dir, motion_input_type=mi_type,
+            max_radar_frames=ds_cfg.get("max_seq_len", 100),
+            max_motion_frames=ds_cfg.get("max_motion_frames", 300),
+        )
         test_loader = DataLoader(test_ds, batch_size=4, shuffle=False,
                                  collate_fn=collate_fn, num_workers=2)
 
     optimizer = optim.AdamW(lm.parameters(), lr=float(ft_cfg["lr"]))
-    prompt = ft_cfg.get("prompt_template", "Describe the motion <Motion Placeholder>.")
+    prompt = ft_cfg.get("prompt_template",
+                        "Describe the motion <Motion Placeholder>.")
     caption_every = args.caption_every
 
-    # 학습 전 캡셔닝 (baseline)
+    # 학습 전 baseline 캡셔닝
     if test_loader:
-        run_test_captioning(vqvae, lm, test_loader, device, epoch=0, max_samples=3,
-                            prompt=prompt)
+        run_test_captioning(vqvae, lm, test_loader, device, epoch=0,
+                            max_samples=3, prompt=prompt)
 
     best_loss = float("inf")
     for epoch in range(ft_cfg["epochs"]):
         lm.train()
         epoch_loss = 0
 
-        for batch in tqdm(train_loader, desc=f"FT {epoch+1}/{ft_cfg['epochs']}"):
+        for batch in tqdm(train_loader,
+                          desc=f"FT {epoch+1}/{ft_cfg['epochs']}"):
             pc = batch["point_cloud"].to(device)
             texts = batch["texts"]
             text_enc = lm.tokenizer(texts, padding=True, truncation=True,
-                                     max_length=128, return_tensors="pt").to(device)
-            
+                                     max_length=128,
+                                     return_tensors="pt").to(device)
+
             with torch.no_grad():
-                    indices, _ = vqvae.encode(pc)
+                indices, _ = vqvae.encode(pc)
 
-            '''
-            if (epoch + 1) % 2 == 0:
-                 with torch.no_grad():
-                    # 진단 코드 전체
-                    indices, _ = vqvae.encode(pc)
-                    unique = indices.unique()
-                    print(f"  [VQ 상태] epoch {epoch+1}")
-                    print(f"  unique tokens: {len(unique)}/{vqvae.quantizer.codebook_size}")
+            outputs = lm.instruction_tune_step(
+                indices, text_enc.input_ids, text_enc.attention_mask, prompt)
 
-
-                    # 2. z_e 다양성
-                    enc_out = vqvae.encoder(pc)
-                    F_group = enc_out["F_group"]
-                    F_all, _, _ = vqvae.masked_agg(F_group, training=False)
-                    z_e = vqvae.anchor_pool(F_all)
-                    print(f"  z_e std: {z_e.std().item():.4f}")
-                    print(f"  z_e 샘플간 차이: {(z_e[0] - z_e[-1]).abs().mean().item():.4f}")
-                    print(f"  F_group 샘플간 차이: {(F_group[0] - F_group[-1]).abs().mean().item():.4f}")
-
-                    # 3. centered 좌표 + anchor 활성화
-                    xyz_c = enc_out["xyz_centered"]
-                    anchors = vqvae.encoder.grouping.anchors
-                    radius = vqvae.encoder.grouping.radius
-
-                    pts = xyz_c[0, 0]
-                    valid = pts.norm(dim=-1) > 1e-6
-                    pts_v = pts[valid]
-                    print(f"  centered 범위: x[{pts_v[:,0].min():.2f},{pts_v[:,0].max():.2f}] "
-                        f"y[{pts_v[:,1].min():.2f},{pts_v[:,1].max():.2f}] "
-                        f"z[{pts_v[:,2].min():.2f},{pts_v[:,2].max():.2f}]")
-
-                    dist = torch.cdist(anchors.unsqueeze(0), pts_v.unsqueeze(0))[0]
-                    hits = (dist < radius).sum(dim=1)
-                    print(f"  활성 anchor: {(hits > 0).sum().item()}/{anchors.shape[0]}")
-
-                    # 4. 샘플별 활성 anchor 비교
-                    for b in range(min(4, pc.shape[0])):
-                        pts = xyz_c[b, 0]
-                        valid = pts.norm(dim=-1) > 1e-6
-                        pts_v = pts[valid]
-                        dist = torch.cdist(anchors.unsqueeze(0), pts_v.unsqueeze(0))[0]
-                        hits = (dist < radius).sum(dim=1)
-                        print(f"  샘플{b}: 활성 {(hits > 0).sum().item()}/64, 유효점 {valid.sum().item()}")
-                    '''
-            outputs = lm.instruction_tune_step(indices, text_enc.input_ids,
-                                                text_enc.attention_mask, prompt)
             optimizer.zero_grad()
             outputs["loss"].backward()
             torch.nn.utils.clip_grad_norm_(lm.parameters(), 1.0)
@@ -600,7 +589,6 @@ def finetune_lm(config, args, vqvae=None, lm=None):
         avg = epoch_loss / max(len(train_loader), 1)
         print(f"  Epoch {epoch+1}: loss={avg:.4f}")
 
-        # 테스트 캡셔닝
         if test_loader and (epoch + 1) % caption_every == 0:
             run_test_captioning(vqvae, lm, test_loader, device, epoch + 1,
                                 max_samples=5, prompt=prompt)
@@ -613,8 +601,10 @@ def finetune_lm(config, args, vqvae=None, lm=None):
     # 최종 캡셔닝 + 저장
     if test_loader:
         run_test_captioning(vqvae, lm, test_loader, device,
-                            epoch=ft_cfg["epochs"], max_samples=10, prompt=prompt)
-        save_test_results(vqvae, lm, test_loader, device, args.output_dir, prompt)
+                            epoch=ft_cfg["epochs"], max_samples=10,
+                            prompt=prompt)
+        save_test_results(vqvae, lm, test_loader, device,
+                         args.output_dir, prompt)
 
     torch.save({"model_state_dict": lm.state_dict()},
                os.path.join(args.output_dir, "lm_finetune_final.pt"))
@@ -635,7 +625,7 @@ def parse_args():
     parser.add_argument("--tokenizer_ckpt", default=None)
     parser.add_argument("--lm_ckpt", default=None)
     parser.add_argument("--caption_every", type=int, default=10,
-                        help="테스트 캡셔닝 주기 (epoch 단위)")
+                        help="테스트 캡셔닝 주기 (epoch)")
     return parser.parse_args()
 
 
@@ -644,6 +634,11 @@ def main():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
     os.makedirs(args.output_dir, exist_ok=True)
+
+    print(f"Config: {args.config}")
+    print(f"Motion encoder: {config.get('motion_encoder', {}).get('input_type', '?')} "
+          f"({config.get('motion_encoder', {}).get('input_dim', '?')}D)")
+    print(f"Pretrained: {config.get('motion_encoder', {}).get('pretrained', 'None')}")
 
     if args.stage == "tokenizer":
         train_tokenizer(config, args)
