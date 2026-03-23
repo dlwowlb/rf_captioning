@@ -3,3 +3,4 @@ from .language_model import RadarAwareLanguageModel, RadarLLM
 from .point_encoder import RadarPointCloudEncoder
 from .motion_encoder import MotionEncoder, build_motion_encoder
 from .humanml3d_repr import convert_to_humanml3d, convert_hymotion_output_to_humanml3d
+from .latent_graph_dynamics import LatentGraphDynamicsModel

@@ -208,7 +208,8 @@ def reg_data(data, pc_size): #
 def process_pc(pointcloud_cfg,sig):
     pc = frame2pointcloud(sig,pointcloud_cfg)
     pc=np.transpose(pc, (1,0))
-    pc = pc[pc[:,3] > 0]
+    #pc = pc[pc[:,3] > 0]
+    pc = pc[pc[:,3] != 0]
     return pc
 ## RFGenesis: Not Used
 

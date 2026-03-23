@@ -17,6 +17,9 @@ RadarLLM 학습 스크립트 — MotionGPT Pretrained 통합
 사용법:
   python scripts/train_RadarLLM.py --stage all --config configs/default.yaml
   python scripts/train_RadarLLM.py --stage tokenizer --config configs/default.yaml
+  python scripts/train_RadarLLM.py --stage pretrain --config configs/default.yaml --output_dir checkpoints --tokenizer_ckpt checkpoints/tokenizer_best.pt
+
+
 """
 
 import os
@@ -407,7 +410,7 @@ def pretrain_lm(config, args, vqvae=None):
     if vqvae is None:
         vqvae = AggregateVQVAE(config).to(device)
         ckpt_path = args.tokenizer_ckpt or os.path.join(
-            args.output_dir, "tokenizer_best.pt")
+            args.output_dir, "tokenizer_final.pt")
         if os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             vqvae.load_state_dict(

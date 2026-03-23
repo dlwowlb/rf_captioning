@@ -10,7 +10,7 @@ This example demonstrates:
  
 Usage:
     python examples/motion_to_doppler.py \
-        --prompt "A person sat, extended both arms to the sides, and then brought them back down." \
+        --prompt "A person leaps forward and lands in a squat." \
         --duration 4.0 \
         --output-dir output/test
 """

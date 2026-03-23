@@ -21,10 +21,11 @@ RadarLLM 데이터셋 생성 (모션 데이터 포함 버전)
 사용법:
   python scripts/generate_pt.py \
       --mode hymotion \
-      --prompts_json HY-Motion-1.0/examples/inference_caption.json \
+      --prompts_json HY-Motion-1.0/examples/objgpt3000.json \
       --hymotion_config HY-Motion-1.0/ckpts/tencent/HY-Motion-1.0/config.yml --hymotion_ckpt HY-Motion-1.0/ckpts/tencent/HY-Motion-1.0/latest.ckpt \
       --radar_config RF-Genesis/models/TI1843_config.json \
-      --output_dir data/radar_text_dataset
+      --output_dir data/radar_text_dataset/New_preprocessing
+      
 
 
 """
@@ -235,8 +236,9 @@ def run_rfgenesis_simulation(smpl_npz_path, radar_config_path, points_per_frame=
         else:
             pc_padded = np.zeros((points_per_frame, 6), dtype=np.float32)
             pc_padded[:len(pc)] = pc
-            dup_idx = np.random.choice(len(pc), points_per_frame - len(pc), replace=True)
-            pc_padded[len(pc):] = pc[dup_idx]
+            ########제로 패딩 대신 랜덤으로 채워넣기##########
+            #dup_idx = np.random.choice(len(pc), points_per_frame - len(pc), replace=True)
+            #pc_padded[len(pc):] = pc[dup_idx]
         point_clouds.append(pc_padded)
 
     return np.array(point_clouds, dtype=np.float32), radar_frames

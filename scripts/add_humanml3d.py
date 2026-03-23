@@ -6,7 +6,7 @@
 motion_humanml3d (263D) 를 계산하여 같은 npz에 덮어쓰기.
 
 사용법:
-  python scripts/add_humanml3d.py --data_dir data/radar_text_dataset
+  python scripts/add_humanml3d.py --data_dir data/radar_text_dataset/gpt_act_simple_263d
   python scripts/add_humanml3d.py --data_dir data/radar_text_dataset/train
   python scripts/add_humanml3d.py --data_dir data/radar_text_dataset --verify
 """
