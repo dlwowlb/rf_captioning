@@ -29,6 +29,7 @@ import torch.optim as optim
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -313,6 +314,9 @@ def train(config, args):
     # ── Training ──
     from models.latent_graph_dynamics import InteractionPseudoLabeler
     phase_labeler = InteractionPseudoLabeler()
+    
+
+
 
     for epoch in range(total_epochs):
         model.train()
@@ -330,7 +334,14 @@ def train(config, args):
             motion = batch["motion"].to(device)
 
             F_mot = motion_enc(motion)  # (B, T_mot, feat_dim)
-            g_motion = F_mot.mean(dim=1)  # (B, feat_dim)
+            #g_motion = F_mot.mean(dim=1)  # (B, feat_dim)
+            m_mask = batch["motion_mask"].to(device).float()  # (B, T_orig)
+
+            # ★ adaptive pooling으로 mask를 F_mot 길이에 맞춤
+            T_out = F_mot.shape[1]
+            m_mask = F.adaptive_max_pool1d(m_mask.unsqueeze(1), T_out).squeeze(1)  # (B, T')
+
+            g_motion = (F_mot * m_mask.unsqueeze(-1)).sum(dim=1) / m_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
 
             # ── Generate interaction phase pseudo-labels ──
             T_radar = pc.shape[1]
@@ -341,7 +352,8 @@ def train(config, args):
                         temporal_mask=radar_mask,
                         phase_labels=phase_labels,
                         phase_confidence=phase_conf)
-
+            
+            
             optimizer.zero_grad()
             out["loss"].backward()
             torch.nn.utils.clip_grad_norm_(
@@ -378,7 +390,14 @@ def train(config, args):
                 motion = batch["motion"].to(device)
 
                 F_mot = motion_enc(motion)  # (B, T_mot, feat_dim)
-                g_motion = F_mot.mean(dim=1)  # (B, feat_dim)
+                #g_motion = F_mot.mean(dim=1)  # (B, feat_dim)
+                m_mask = batch["motion_mask"].to(device).float()  # (B, T_orig)
+
+                # ★ adaptive pooling으로 mask를 F_mot 길이에 맞춤
+                T_out = F_mot.shape[1]
+                m_mask = F.adaptive_max_pool1d(m_mask.unsqueeze(1), T_out).squeeze(1)  # (B, T')
+
+                g_motion = (F_mot * m_mask.unsqueeze(-1)).sum(dim=1) / m_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
 
                 T_radar = pc.shape[1]
                 phase_labels, phase_conf = _generate_batch_phase_labels(

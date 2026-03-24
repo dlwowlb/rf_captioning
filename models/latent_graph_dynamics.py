@@ -12,7 +12,7 @@ v5.1 → v5.2 fixes:
 
 Loss: L_obs + β·L_KL + λ_m·L_rm  [+ λ_ph·L_phase]
 """
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -58,9 +58,10 @@ class ObservationEncoder(nn.Module):
             prev = h
         layers.append(nn.Linear(prev, out_dim))
         self.mlp = nn.Sequential(*layers)
+        self.out_norm = nn.LayerNorm(out_dim)
 
     def forward(self, Y):
-        return self.mlp(Y)
+        return self.out_norm(self.mlp(Y))
 
 
 # ═══════════════════════════════════════════════════════════
@@ -74,13 +75,22 @@ class LatentNodeInitializer(nn.Module):
             embed_dim=node_dim, num_heads=num_heads,
             kdim=feat_dim, vdim=feat_dim, batch_first=True)
         self.proj = nn.Linear(node_dim, node_dim)
+        self.norm = nn.LayerNorm(node_dim)
 
     def forward(self, node_queries, point_features, point_mask=None):
-        key_padding_mask = ~point_mask if point_mask is not None else None
+        if point_mask is not None:
+            # ★ all-invalid sample 방어: 해당 sample은 diagonal visible
+            any_valid = point_mask.any(dim=-1)                    # (B,)
+            safe_mask = point_mask.clone()
+            if (~any_valid).any():
+                safe_mask[~any_valid, 0] = True                   # 최소 1개 visible
+            key_padding_mask = ~safe_mask
+        else:
+            key_padding_mask = None
         out, _ = self.cross_attn(
             node_queries, point_features, point_features,
             key_padding_mask=key_padding_mask)
-        return self.proj(out) + node_queries
+        return self.norm(self.proj(out) + node_queries)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -152,6 +162,7 @@ class ContextConditionedTransition(nn.Module):
         self.self_attn = nn.MultiheadAttention(
             embed_dim=node_dim, num_heads=num_heads, batch_first=True)
         self.sa_norm = nn.LayerNorm(node_dim)
+        self.pre_sa_norm = nn.LayerNorm(node_dim)
 
         self.ctx_to_gamma_raw = nn.Linear(ctx_dim, node_dim)
         self.ctx_to_beta = nn.Linear(ctx_dim, node_dim)
@@ -163,7 +174,8 @@ class ContextConditionedTransition(nn.Module):
 
     def forward(self, prev_nodes, context):
         B, M, D = prev_nodes.shape
-        sa_out, _ = self.self_attn(prev_nodes, prev_nodes, prev_nodes)
+        normed = self.pre_sa_norm(prev_nodes)
+        sa_out, _ = self.self_attn(normed, normed, normed)
         nodes = self.sa_norm(prev_nodes + sa_out)
 
         gamma = 1.0 + self.film_scale * torch.tanh(
@@ -262,6 +274,7 @@ class EvidenceExtractor(nn.Module):
         confidence = self.confidence_head(conf_input)        # (B, M, 1)
 
         # Evidence via softmax attention
+        logits = logits.clamp(-30, 30)
         attn = torch.nan_to_num(logits.softmax(dim=-1), nan=0.0)
         out = (attn @ V).transpose(1, 2).reshape(B, M, -1)
         evidence = self.out_proj(out)
@@ -284,6 +297,7 @@ class PosteriorUpdate(nn.Module):
             nn.Linear(node_dim * 2, node_dim), nn.GELU(),
             nn.Linear(node_dim, node_dim),
         )
+        self.fuse_norm = nn.LayerNorm(node_dim)
         self.self_attn = nn.MultiheadAttention(
             embed_dim=node_dim, num_heads=num_heads, batch_first=True)
         self.sa_norm = nn.LayerNorm(node_dim)
@@ -293,6 +307,7 @@ class PosteriorUpdate(nn.Module):
     def forward(self, prior, evidence, confidence, training=True):
         fused = self.fuse(torch.cat([prior, evidence], dim=-1))
         gated = confidence * fused + (1 - confidence) * prior
+        gated = self.fuse_norm(gated)
         sa_out, _ = self.self_attn(gated, gated, gated)
         coordinated = self.sa_norm(gated + sa_out)
         mu = self.post_mu(coordinated)
@@ -519,6 +534,23 @@ class LatentGraphDynamicsModel(nn.Module):
         U = self.obs_encoder(Y)
         pmask = self._point_mask(Y)
 
+        # ★ temporal_mask과 point_mask 동기화:
+        #   프레임이 valid라고 되어있어도 실제 유효 포인트가 0이면 invalid 처리
+        if temporal_mask is not None:
+            frame_has_points = pmask.any(dim=-1)               # (B, T) — 프레임에 유효 점이 있는지
+            temporal_mask = temporal_mask & frame_has_points    # 둘 다 True여야 valid
+
+            # prefix-valid 재보장: 첫 invalid 이후는 전부 invalid
+            for b in range(B):
+                valid_len = temporal_mask[b].long().sum()
+                temporal_mask[b, valid_len:] = False
+
+            # t=0이 invalid이면 강제로 살림 (최소 1프레임 보장)
+            if not temporal_mask[:, 0].all():
+                temporal_mask[:, 0] = True
+
+
+
         # [fix-C] t=0은 항상 valid라고 가정 (prefix-valid 구조)
         queries = self.node_queries.expand(B, -1, -1)
         nodes = self.node_init(queries, U[:, 0], pmask[:, 0])
@@ -579,6 +611,10 @@ class LatentGraphDynamicsModel(nn.Module):
             prev_conf = conf.detach()
 
             recon = self.decoder(nodes)
+
+      
+
+
 
             # [fix-E] History: keep with grad, trim to K
             node_hist.append(nodes)
@@ -700,7 +736,16 @@ class LatentGraphDynamicsModel(nn.Module):
         g_m = F.normalize(g_m, dim=-1)
         sim = g_r @ g_m.t() / self.contrastive_temp
         lab = torch.arange(sim.shape[0], device=sim.device)
+        B = sim.shape[0]
+        raw = (F.cross_entropy(sim, lab) + F.cross_entropy(sim.t(), lab)) / 2
+        return raw / max(np.log(B), 1.0)   # ★ log(B)로 나눠서 정규화
+        '''
+        g_r = F.normalize(g_r, dim=-1)
+        g_m = F.normalize(g_m, dim=-1)
+        sim = g_r @ g_m.t() / self.contrastive_temp
+        lab = torch.arange(sim.shape[0], device=sim.device)
         return (F.cross_entropy(sim, lab) + F.cross_entropy(sim.t(), lab)) / 2
+        '''
 
     @torch.no_grad()
     def encode(self, point_cloud, temporal_mask=None):
