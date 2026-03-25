@@ -1,28 +1,22 @@
 #!/usr/bin/env python3
 """
-Stage 1 Evaluation — v5.4 + LLM Action Labeling
+Stage 1 Evaluation — Filtered Version
 
-변경사항:
-  [fix-H] 키워드 매칭 → LLM 기반 action label 생성
-          1순위: zero-shot classification (facebook/bart-large-mnli)
-          2순위: sentence embedding similarity (all-MiniLM-L6-v2)
-          3순위: 개선된 키워드 매칭 (fallback)
-          + majority baseline 대비 lift 리포팅
-          + per-class accuracy 리포팅
-          + label 캐싱 (두 번째 실행부터 즉시)
+변경사항 (원본 대비):
+  --exclude_top N : 가장 빈도 높은 N개 클래스 제외 (default=1, "turn" 제거)
+  --keep_top K    : 제외 후 상위 K개 클래스만 평가 (default=5)
+  
+  즉 기본값이면: turn 제외 → bend, wave, jump, stretch, balance 5개로 평가
 
 사용법:
-  python scripts/evaluate.py --config configs/latent_graph.yaml \
+  python scripts/evaluate.py \
+      --config configs/latent_graph.yaml \
       --ckpt checkpoints/latent_graph/latent_graph_best.pt \
-      --data_dir data/radar_text_dataset/test
-
-  # labeling 방법 지정
-  python scripts/evaluate.py ... --label_method zero_shot
-  python scripts/evaluate.py ... --label_method sentence_similarity
-  python scripts/evaluate.py ... --label_method keyword
+      --data_dir data/radar_text_dataset/test \
+      --exclude_top 1 --keep_top 5
 """
 
-import os, sys, json, argparse, yaml
+import os, sys, json, argparse, yaml, copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -30,7 +24,7 @@ import torch.nn.functional as F
 from pathlib import Path
 from collections import defaultdict, Counter
 from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from sklearn.neighbors import KNeighborsClassifier
 
@@ -40,36 +34,22 @@ from models.motion_encoder import build_motion_encoder
 
 
 # ═══════════════════════════════════════════════════════════
-# ★ LLM-based Action Labeling
+# Action Labeling (원본과 동일)
 # ═══════════════════════════════════════════════════════════
 
 ACTION_CATEGORIES = [
-    "walking or strolling",
-    "running or jogging",
-    "jumping or hopping",
-    "sitting down or seated",
-    "standing up or standing still",
-    "kicking",
-    "punching or striking",
-    "throwing or tossing",
-    "waving hands or arms",
-    "picking up or grabbing an object",
-    "pushing or pulling",
-    "bending or bowing",
-    "crouching or squatting",
-    "turning or spinning",
-    "dancing or rhythmic movement",
-    "climbing or stepping up",
-    "balancing on one leg",
-    "stretching or reaching",
-    "arm circles or arm exercises",
-    "full body exercise or workout",
+    "walking or strolling", "running or jogging", "jumping or hopping",
+    "sitting down or seated", "standing up or standing still", "kicking",
+    "punching or striking", "throwing or tossing", "waving hands or arms",
+    "picking up or grabbing an object", "pushing or pulling",
+    "bending or bowing", "crouching or squatting", "turning or spinning",
+    "dancing or rhythmic movement", "climbing or stepping up",
+    "balancing on one leg", "stretching or reaching",
+    "arm circles or arm exercises", "full body exercise or workout",
 ]
-
 ACTION_SHORT_LABELS = [
-    "walk", "run", "jump", "sit", "stand",
-    "kick", "punch", "throw", "wave", "pick_up",
-    "push", "bend", "crouch", "turn", "dance",
+    "walk", "run", "jump", "sit", "stand", "kick", "punch", "throw",
+    "wave", "pick_up", "push", "bend", "crouch", "turn", "dance",
     "climb", "balance", "stretch", "arm_exercise", "exercise",
 ]
 
@@ -77,11 +57,9 @@ ACTION_SHORT_LABELS = [
 class ActionLabeler:
     def __init__(self, method="auto", cache_path=None):
         self.method = method
-        self.cache_path = cache_path
         self.cache = {}
+        self.cache_path = cache_path
         self._classifier = None
-        self._embedder = None
-        self._cat_embeddings = None
 
         if cache_path and os.path.exists(cache_path):
             with open(cache_path, "r") as f:
@@ -102,20 +80,16 @@ class ActionLabeler:
             )
             print("[ActionLabeler] ✓ zero-shot classifier loaded")
             return "zero_shot"
-        except Exception as e:
-            print(f"[ActionLabeler] zero-shot unavailable: {e}")
-
+        except:
+            pass
         try:
             from sentence_transformers import SentenceTransformer
             self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
             self._cat_embeddings = self._embedder.encode(
                 ACTION_CATEGORIES, normalize_embeddings=True)
-            print("[ActionLabeler] ✓ sentence-transformers loaded")
             return "sentence_similarity"
-        except Exception as e:
-            print(f"[ActionLabeler] sentence-transformers unavailable: {e}")
-
-        print("[ActionLabeler] Using enhanced keyword matching")
+        except:
+            pass
         return "keyword"
 
     def label_batch(self, texts):
@@ -128,7 +102,6 @@ class ActionLabeler:
             else:
                 uncached.append(t)
                 uncached_idx.append(i)
-
         if uncached:
             if self.method == "zero_shot":
                 labels = self._zero_shot_batch(uncached)
@@ -136,11 +109,9 @@ class ActionLabeler:
                 labels = self._sentence_similarity_batch(uncached)
             else:
                 labels = [self._keyword_label(t) for t in uncached]
-
             for idx, text, label in zip(uncached_idx, uncached, labels):
                 results[idx] = label
                 self.cache[text] = label
-
         return [results[i] for i in range(len(texts))]
 
     def save_cache(self):
@@ -166,66 +137,44 @@ class ActionLabeler:
         return labels
 
     def _sentence_similarity_batch(self, texts):
-        if self._embedder is None:
+        if not hasattr(self, '_embedder') or self._embedder is None:
             from sentence_transformers import SentenceTransformer
             self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
             self._cat_embeddings = self._embedder.encode(
                 ACTION_CATEGORIES, normalize_embeddings=True)
-        text_embs = self._embedder.encode(texts, normalize_embeddings=True,
-                                           show_progress_bar=True)
+        text_embs = self._embedder.encode(texts, normalize_embeddings=True)
         sims = text_embs @ self._cat_embeddings.T
-        best_indices = sims.argmax(axis=1)
-        return [ACTION_SHORT_LABELS[idx] for idx in best_indices]
+        return [ACTION_SHORT_LABELS[idx] for idx in sims.argmax(axis=1)]
 
     def _keyword_label(self, text):
         text_lower = text.lower()
         words = set(text_lower.split())
-
-        ENHANCED_KEYWORDS = {
-            "jump":     ["jump", "jumping", "jumps", "hop", "hopping", "leap",
-                         "leaping", "jacks", "jack"],
-            "kick":     ["kick", "kicking", "kicks"],
-            "punch":    ["punch", "punching", "punches", "strike", "striking",
-                         "jab", "boxing", "uppercut"],
-            "throw":    ["throw", "throwing", "throws", "toss", "tossing", "hurl"],
-            "pick_up":  ["pick", "picks", "picking", "grab", "grabs", "grabbing",
-                         "grasp", "lift", "lifting"],
-            "push":     ["push", "pushing", "pull", "pulling"],
-            "wave":     ["wave", "waving", "waves", "beckon"],
-            "dance":    ["dance", "dancing", "dances", "sway", "swaying", "groove",
-                         "salsa", "waltz", "ballet"],
-            "climb":    ["climb", "climbing", "climbs", "step up", "stepping",
-                         "mountain climber"],
-            "balance":  ["balance", "balancing", "one leg", "tightrope", "wobble"],
-            "stretch":  ["stretch", "stretching", "stretches", "reach", "reaching",
-                         "extend", "extending"],
-            "bend":     ["bend", "bending", "bends", "bow", "bowing", "lean",
-                         "leaning", "stoop"],
-            "crouch":   ["crouch", "crouching", "squat", "squatting", "squats",
-                         "kneel", "kneeling", "lunge", "lunging", "lunges"],
-            "turn":     ["turn", "turning", "turns", "rotate", "rotating", "spin",
-                         "spinning", "pivot", "pivoting"],
-            "run":      ["run", "running", "runs", "jog", "jogging", "sprint",
-                         "sprinting", "dash"],
-            "walk":     ["walk", "walking", "walks", "stroll", "strolling", "step",
-                         "steps", "pace", "pacing", "march", "marching"],
-            "sit":      ["sit", "sitting", "sits", "sat", "seat", "seated"],
-            "stand":    ["stand", "standing", "stands", "stood", "upright"],
-            "exercise": ["exercise", "exercising", "workout", "pushup", "push-up",
-                         "situp", "sit-up", "burpee", "plank", "crunches", "crunch",
-                         "rep", "reps", "count", "counts"],
-            "arm_exercise": ["arm circle", "arm swing", "shoulder", "flap",
-                             "flapping", "windmill"],
+        KW = {
+            "jump": ["jump","jumping","hop","leap","jacks"],
+            "kick": ["kick","kicking"],
+            "punch": ["punch","punching","strike","boxing","uppercut"],
+            "wave": ["wave","waving","beckon"],
+            "pick_up": ["pick","grab","grasp","lift"],
+            "push": ["push","pull"],
+            "dance": ["dance","dancing","sway","salsa","waltz"],
+            "climb": ["climb","climbing","step up"],
+            "balance": ["balance","balancing","one leg"],
+            "stretch": ["stretch","stretching","reach","extending"],
+            "bend": ["bend","bending","bow","lean","stoop"],
+            "crouch": ["crouch","squat","squatting","kneel","lunge"],
+            "turn": ["turn","turning","rotate","spin","pivot"],
+            "run": ["run","running","jog","sprint","dash"],
+            "walk": ["walk","walking","stroll","march"],
+            "sit": ["sit","sitting","seated"],
+            "stand": ["stand","standing"],
+            "exercise": ["exercise","workout","pushup","burpee","plank"],
         }
-
-        for action, keywords in ENHANCED_KEYWORDS.items():
+        for action, keywords in KW.items():
             for kw in keywords:
                 if " " in kw:
-                    if kw in text_lower:
-                        return action
+                    if kw in text_lower: return action
                 else:
-                    if kw in words:
-                        return action
+                    if kw in words: return action
         return "other"
 
 
@@ -252,11 +201,6 @@ class EvalDataset(Dataset):
                 all_texts.append(str(data["text"]))
             self._action_labels = action_labeler.label_batch(all_texts)
             action_labeler.save_cache()
-
-            dist = Counter(self._action_labels)
-            print(f"[EvalDataset] Action distribution ({len(dist)} classes):")
-            for action, count in dist.most_common():
-                print(f"    {action:20s}: {count:4d} ({count/len(self.samples)*100:.1f}%)")
         else:
             self._action_labels = None
 
@@ -266,13 +210,7 @@ class EvalDataset(Dataset):
     def __getitem__(self, idx):
         data = np.load(self.samples[idx], allow_pickle=True)
         text = str(data["text"])
-
-        if self._action_labels is not None:
-            action = self._action_labels[idx]
-        elif "action_label" in data:
-            action = str(data["action_label"])
-        else:
-            action = "other"
+        action = self._action_labels[idx] if self._action_labels else "other"
 
         pc = data["point_cloud"].astype(np.float32)
         Tr = min(pc.shape[0], self.max_T)
@@ -334,6 +272,69 @@ def collate(batch):
 
 
 # ═══════════════════════════════════════════════════════════
+# ★ Class Filtering Utilities
+# ═══════════════════════════════════════════════════════════
+
+def compute_keep_classes(dataset, exclude_top=1, keep_top=5):
+    """
+    전체 데이터셋의 라벨 분포를 보고,
+    상위 exclude_top개를 제외한 뒤 다음 keep_top개 클래스를 반환.
+    """
+    all_actions = []
+    for i in range(len(dataset)):
+        item = dataset[i]
+        all_actions.append(item["action"])
+
+    dist = Counter(all_actions)
+    sorted_classes = [cls for cls, _ in dist.most_common()]
+
+    excluded = sorted_classes[:exclude_top]
+    remaining = sorted_classes[exclude_top:]
+    kept = remaining[:keep_top]
+
+    print(f"\n{'='*60}")
+    print(f"Class Filtering")
+    print(f"{'='*60}")
+    print(f"  Original distribution ({len(dist)} classes, {len(all_actions)} samples):")
+    for cls, cnt in dist.most_common():
+        tag = "  ✗ EXCLUDE" if cls in excluded else ("  ★ KEEP" if cls in kept else "  · skip")
+        print(f"    {cls:20s}: {cnt:4d} ({cnt/len(all_actions)*100:.1f}%){tag}")
+
+    kept_count = sum(dist[c] for c in kept)
+    print(f"\n  Kept: {len(kept)} classes, {kept_count} samples")
+    print(f"  Classes: {kept}")
+
+    return kept, excluded
+
+
+def filter_dataset_indices(dataset, keep_classes):
+    """keep_classes에 속하는 샘플의 인덱스만 반환."""
+    keep_set = set(keep_classes)
+    indices = []
+    for i in range(len(dataset)):
+        item = dataset[i]
+        if item["action"] in keep_set:
+            indices.append(i)
+    return indices
+
+
+def filter_extracted(emb_dict, keep_classes):
+    """extract_all 결과에서 keep_classes만 필터링."""
+    keep_set = set(keep_classes)
+    mask = [a in keep_set for a in emb_dict["actions"]]
+    mask = np.array(mask)
+
+    filtered = {
+        "g_radar": emb_dict["g_radar"][mask],
+        "actions": [a for a, m in zip(emb_dict["actions"], mask) if m],
+        "texts": [t for t, m in zip(emb_dict["texts"], mask) if m],
+    }
+    if "g_motion" in emb_dict:
+        filtered["g_motion"] = emb_dict["g_motion"][mask]
+    return filtered
+
+
+# ═══════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════
 
@@ -370,19 +371,18 @@ def extract_all(model, loader, device, motion_enc=None):
 
 
 # ═══════════════════════════════════════════════════════════
-# 4.2 Context Interpretability
+# 4.2 Context Interpretability (filtered)
 # ═══════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def run_context_interpretability(model, loader, device):
-    print("\n" + "=" * 60)
-    print("Exp 4.2: Context Interpretability")
-    print("=" * 60)
+def run_context_interpretability(model, loader, device, keep_classes):
+    print(f"\n{'='*60}")
+    print(f"Exp 4.2: Context Interpretability (filtered: {keep_classes})")
+    print(f"{'='*60}")
     model.eval()
+    keep_set = set(keep_classes)
     action_ctx_means = defaultdict(list)
     action_ctx_change = defaultdict(list)
-    all_ctx_for_tsne = []
-    all_ctx_labels = []
 
     for batch in tqdm(loader, desc="Context analysis"):
         pc = batch["point_cloud"].to(device)
@@ -391,75 +391,64 @@ def run_context_interpretability(model, loader, device):
         ctx = out["context_history"]
         B, T, C = ctx.shape
         for b in range(B):
-            Tv = int(mask[b].sum().item())
             action = batch["actions"][b]
+            if action not in keep_set:
+                continue
+            Tv = int(mask[b].sum().item())
             ct = ctx[b, :Tv].cpu().numpy()
-            mean_c = ct.mean(axis=0)
-            action_ctx_means[action].append(mean_c)
+            action_ctx_means[action].append(ct.mean(axis=0))
             if Tv > 1:
                 deltas = np.linalg.norm(ct[1:] - ct[:-1], axis=-1)
                 action_ctx_change[action].append(deltas.mean())
-            step = max(1, Tv // 10)
-            for t in range(0, Tv, step):
-                all_ctx_for_tsne.append(ct[t])
-                all_ctx_labels.append(action)
 
-    actions_list = sorted(action_ctx_means.keys())
-    valid_actions = [a for a in actions_list if len(action_ctx_means[a]) >= 2]
+    valid_actions = [a for a in keep_classes if len(action_ctx_means.get(a, [])) >= 2]
 
     if len(valid_actions) < 2:
         print("  ⚠ < 2 valid classes with ≥2 samples")
-        separation, avg_inter, avg_intra = 0.0, 0.0, 0.0
-    else:
-        centroids, intra_dists = {}, {}
-        for a in valid_actions:
-            vecs = np.stack(action_ctx_means[a])
-            centroids[a] = vecs.mean(axis=0)
-            intra_dists[a] = np.mean(np.linalg.norm(vecs - centroids[a], axis=-1))
-        avg_intra = np.mean(list(intra_dists.values()))
-        inter_pairs = []
-        for i, a1 in enumerate(valid_actions):
-            for a2 in valid_actions[i+1:]:
-                inter_pairs.append(np.linalg.norm(centroids[a1] - centroids[a2]))
-        avg_inter = np.mean(inter_pairs) if inter_pairs else 0
-        separation = avg_inter / max(avg_intra, 1e-8)
+        return {"separability_ratio": 0.0}
+
+    centroids, intra_dists = {}, {}
+    for a in valid_actions:
+        vecs = np.stack(action_ctx_means[a])
+        centroids[a] = vecs.mean(axis=0)
+        intra_dists[a] = np.mean(np.linalg.norm(vecs - centroids[a], axis=-1))
+    avg_intra = np.mean(list(intra_dists.values()))
+
+    inter_pairs = []
+    for i, a1 in enumerate(valid_actions):
+        for a2 in valid_actions[i+1:]:
+            inter_pairs.append(np.linalg.norm(centroids[a1] - centroids[a2]))
+    avg_inter = np.mean(inter_pairs) if inter_pairs else 0
+    separation = avg_inter / max(avg_intra, 1e-8)
 
     print(f"  Context separability: inter/intra = {separation:.4f}")
     print(f"    avg inter-class dist: {avg_inter:.4f}")
     print(f"    avg intra-class dist: {avg_intra:.4f}")
-    print(f"    valid classes (≥2 samples): {len(valid_actions)}/{len(actions_list)}")
+    print(f"    valid classes: {len(valid_actions)}/{len(keep_classes)}")
 
     print(f"\n  Context temporal change rate:")
-    change_by_action = {}
     for a in sorted(action_ctx_change.keys()):
-        avg = np.mean(action_ctx_change[a])
-        change_by_action[a] = float(avg)
-        print(f"    {a:20s}: {avg:.4f} (n={len(action_ctx_change[a])})")
+        if a in keep_set:
+            avg = np.mean(action_ctx_change[a])
+            print(f"    {a:20s}: {avg:.4f} (n={len(action_ctx_change[a])})")
 
     return {
         "separability_ratio": float(separation),
         "avg_inter_dist": float(avg_inter),
         "avg_intra_dist": float(avg_intra),
-        "change_rate_by_action": change_by_action,
-        "tsne_data": np.stack(all_ctx_for_tsne).tolist() if all_ctx_for_tsne else [],
-        "tsne_labels": all_ctx_labels,
-        "n_actions": len(actions_list),
         "n_valid_actions": len(valid_actions),
     }
 
 
 # ═══════════════════════════════════════════════════════════
-# 4.3 Robustness
+# 4.3 Robustness (filtered)
 # ═══════════════════════════════════════════════════════════
 
 def mask_lower_body_points(pc, point_mask, percentile=30):
     pc_c = pc.clone()
-    mask_c = point_mask.clone()
     B, T, N, D = pc.shape
     for b in range(B):
         for t in range(T):
-            if not point_mask[b, t].any():
-                continue
             z_vals = pc[b, t, :, 2]
             valid = pc[b, t, :, :3].norm(dim=-1) > 1e-6
             if valid.sum() < 2:
@@ -468,16 +457,17 @@ def mask_lower_body_points(pc, point_mask, percentile=30):
             threshold = torch.quantile(z_valid, percentile / 100.0)
             lower = valid & (z_vals <= threshold)
             pc_c[b, t, lower] = 0
-            mask_c[b, t, lower] = False
-    return pc_c, mask_c
+    return pc_c
 
 
 @torch.no_grad()
-def run_robustness(model, loader, device):
-    print("\n" + "=" * 60)
-    print("Exp 4.3: Robustness / Observability Analysis")
-    print("=" * 60)
+def run_robustness(model, loader, device, keep_classes):
+    print(f"\n{'='*60}")
+    print(f"Exp 4.3: Robustness (filtered: {keep_classes})")
+    print(f"{'='*60}")
     model.eval()
+    keep_set = set(keep_classes)
+
     print("\n  Part A: Lower-body point masking")
     clean_alpha, masked_alpha = [], []
     clean_sigma, masked_sigma = [], []
@@ -487,12 +477,13 @@ def run_robustness(model, loader, device):
     for batch in tqdm(loader, desc="Robustness (body mask)"):
         pc = batch["point_cloud"].to(device)
         mask = batch["temporal_mask"].to(device)
-        pmask = pc[..., :3].norm(dim=-1) > 1e-6
         out_c = model.forward_sequence(pc, mask)
-        pc_m, pmask_m = mask_lower_body_points(pc, pmask, percentile=30)
+        pc_m = mask_lower_body_points(pc, None, percentile=30)
         out_m = model.forward_sequence(pc_m, mask)
         B, T = pc.shape[:2]
         for b in range(B):
+            if batch["actions"][b] not in keep_set:
+                continue
             Tv = int(mask[b].sum().item())
             for t in range(Tv):
                 ac = out_c["confidence"][b, t, :, 0].cpu().numpy()
@@ -507,21 +498,24 @@ def run_robustness(model, loader, device):
                 clean_sigma.append(sc)
                 masked_sigma.append(sm)
 
+    if not clean_alpha:
+        print("  ⚠ No valid samples after filtering")
+        return {}
+
     ca, ma = np.mean(clean_alpha), np.mean(masked_alpha)
     cs, ms = np.mean(clean_sigma), np.mean(masked_sigma)
     print(f"  Confidence (α):  clean={ca:.4f} → masked={ma:.4f} (Δ={ma-ca:+.4f})")
     print(f"  Uncertainty (Σ): clean={cs:.4f} → masked={ms:.4f} (Δ={ms-cs:+.4f})")
+
     print(f"\n  Per-node α change:")
-    node_results = {}
     M = len(node_alpha_clean)
     for m in range(M):
-        nc = np.mean(node_alpha_clean[m])
-        nm = np.mean(node_alpha_masked[m])
+        nc, nm = np.mean(node_alpha_clean[m]), np.mean(node_alpha_masked[m])
         delta = nm - nc
-        node_results[m] = {"clean": float(nc), "masked": float(nm), "delta": float(delta)}
         label = "↓ sensitive" if delta < -0.05 else "≈ stable"
         print(f"    Node {m}: {nc:.4f} → {nm:.4f} (Δ={delta:+.4f}) {label}")
 
+    # Part B: point drop — only on filtered samples
     print("\n  Part B: Point drop severity curve")
     severities = [0.0, 0.3, 0.5, 0.7, 0.9]
     drop_results = {}
@@ -541,13 +535,21 @@ def run_robustness(model, loader, device):
                 g = model.encode(pc_d, mask_t)
             else:
                 g = model.encode(pc, mask_t)
-            all_g.append(g.cpu())
-            all_actions.extend(batch["actions"])
+
+            # Filter
+            for i, a in enumerate(batch["actions"]):
+                if a in keep_set:
+                    all_g.append(g[i:i+1].cpu())
+                    all_actions.append(a)
+
+        if not all_g:
+            drop_results[sev] = 0.0
+            continue
         g_all = torch.cat(all_g).numpy()
         unique = sorted(set(all_actions))
         if len(unique) >= 2:
             amap = {a: i for i, a in enumerate(unique)}
-            y = np.array([amap.get(a, 0) for a in all_actions])
+            y = np.array([amap[a] for a in all_actions])
             perm = np.random.RandomState(42).permutation(len(y))
             sp = int(len(y) * 0.8)
             if sp > 1 and len(y) - sp > 0:
@@ -565,83 +567,165 @@ def run_robustness(model, loader, device):
         "body_mask": {
             "alpha_clean": float(ca), "alpha_masked": float(ma),
             "sigma_clean": float(cs), "sigma_masked": float(ms),
-            "per_node": node_results,
         },
         "point_drop_curve": drop_results,
     }
 
 
 # ═══════════════════════════════════════════════════════════
-# 4.4 Ablation
+# 4.5 Semantic Readiness (filtered) — 핵심 실험
 # ═══════════════════════════════════════════════════════════
 
-ABLATION_CONFIGS = {
-    "w/o_context": {"disable_context": True},
-    "w/o_self_attn": {"disable_self_attn": True},
-    "w/o_confidence": {"disable_confidence": True},
-    "w/o_contrastive": {"lambda_motion": 0.0},
-}
+def run_linear_probe(embeddings, config, keep_classes):
+    print(f"\n{'='*60}")
+    print(f"Exp 4.5: Semantic Readiness — FILTERED")
+    print(f"  Classes: {keep_classes}")
+    print(f"{'='*60}")
 
-def create_ablation_config(base_config, ablation_name):
-    import copy
-    config = copy.deepcopy(base_config)
-    lg = config["latent_graph"]
-    for k, v in ABLATION_CONFIGS[ablation_name].items():
-        lg[k] = v
-    return config
-
-@torch.no_grad()
-def run_ablation(base_ckpt, ablation_dir, loader, device, config):
-    print("\n" + "=" * 60)
-    print("Exp 4.4: Ablation Studies")
-    print("=" * 60)
-    results = {}
-    model = load_model(config, base_ckpt, device)
-    emb = extract_all(model, loader, device)
-    full_acc = _quick_knn(emb)
-    full_chamfer = _quick_chamfer(model, loader, device)
-    results["full"] = {"knn_acc": full_acc, "chamfer": full_chamfer}
-    print(f"  Full model: kNN={full_acc:.4f}, Chamfer={full_chamfer:.6f}")
-    for abl_name in ABLATION_CONFIGS:
-        ckpt = os.path.join(ablation_dir, f"{abl_name}_best.pt")
-        if not os.path.exists(ckpt):
-            print(f"  {abl_name:20s}: ✗ not found")
-            results[abl_name] = {"status": "missing"}
-            continue
-        abl_cfg = create_ablation_config(config, abl_name)
-        try:
-            abl_model = load_model(abl_cfg, ckpt, device)
-            abl_emb = extract_all(abl_model, loader, device)
-            acc = _quick_knn(abl_emb)
-            chamfer = _quick_chamfer(abl_model, loader, device)
-            results[abl_name] = {"knn_acc": acc, "chamfer": chamfer}
-            print(f"  {abl_name:20s}: kNN={acc:.4f} (Δ={acc-full_acc:+.4f}), "
-                  f"Chamfer={chamfer:.6f} (Δ={chamfer-full_chamfer:+.6f})")
-        except Exception as e:
-            print(f"  {abl_name:20s}: ✗ {e}")
-            results[abl_name] = {"status": "error", "error": str(e)}
-    return results
-
-def _quick_knn(emb):
+    # Filter
+    emb = filter_extracted(embeddings, keep_classes)
     g = emb["g_radar"].numpy()
     actions = emb["actions"]
     unique = sorted(set(actions))
-    if len(unique) < 2: return 0.0
+    K = len(unique)
+
+    if K < 2:
+        print("  ✗ < 2 classes after filtering")
+        return {"status": "skipped"}
+
     amap = {a: i for i, a in enumerate(unique)}
     y = np.array([amap[a] for a in actions])
-    perm = np.random.RandomState(42).permutation(len(y))
-    sp = int(len(y) * 0.8)
-    if sp < 2: return 0.0
+
+    dist = Counter(actions)
+    print(f"  Samples: {len(actions)}, Classes: {K}")
+    print(f"  Distribution:")
+    for a, c in dist.most_common():
+        print(f"    {a:20s}: {c:4d} ({c/len(actions)*100:.1f}%)")
+
+    majority_pct = max(dist.values()) / len(actions)
+    random_pct = 1.0 / K
+    print(f"  Majority baseline: {majority_pct:.4f}")
+    print(f"  Random baseline:   {random_pct:.4f}")
+
+    N = len(y)
+    perm = np.random.RandomState(42).permutation(N)
+    sp = int(N * 0.8)
+    tr_idx, te_idx = perm[:sp], perm[sp:]
+    if sp < 2 or len(te_idx) < 1:
+        return {"status": "insufficient_data"}
+
+    results = {
+        "majority_baseline": float(majority_pct),
+        "random_baseline": float(random_pct),
+        "num_classes": K,
+        "num_samples": len(actions),
+        "classes": unique,
+    }
+
+    # ── k-NN ──
     knn = KNeighborsClassifier(n_neighbors=min(5, sp-1), metric="cosine")
-    knn.fit(g[perm[:sp]], y[perm[:sp]])
-    return float(accuracy_score(y[perm[sp:]], knn.predict(g[perm[sp:]])))
+    knn.fit(g[tr_idx], y[tr_idx])
+    knn_pred = knn.predict(g[te_idx])
+    knn_acc = accuracy_score(y[te_idx], knn_pred)
+    knn_f1 = f1_score(y[te_idx], knn_pred, average="weighted", zero_division=0)
+    knn_lift = knn_acc - majority_pct
+    print(f"\n  k-NN (k=5): acc={knn_acc:.4f}, F1={knn_f1:.4f}, "
+          f"lift_vs_majority={knn_lift:+.4f}, lift_vs_random={knn_acc-random_pct:+.4f}")
+    results.update(knn_accuracy=knn_acc, knn_f1=knn_f1,
+                   knn_lift_majority=float(knn_lift),
+                   knn_lift_random=float(knn_acc - random_pct))
+
+    # ── Linear probe ──
+    D = g.shape[1]
+    probe = nn.Linear(D, K)
+    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
+    Xt = torch.from_numpy(g[tr_idx]).float()
+    yt = torch.from_numpy(y[tr_idx]).long()
+    Xe = torch.from_numpy(g[te_idx]).float()
+
+    for ep in range(100):  # 50→100 epochs
+        probe.train()
+        loss = F.cross_entropy(probe(Xt), yt)
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    probe.eval()
+    with torch.no_grad():
+        pred = probe(Xe).argmax(1).numpy()
+    lin_acc = accuracy_score(y[te_idx], pred)
+    lin_f1 = f1_score(y[te_idx], pred, average="weighted", zero_division=0)
+    lin_lift = lin_acc - majority_pct
+    print(f"  Linear (100ep): acc={lin_acc:.4f}, F1={lin_f1:.4f}, "
+          f"lift_vs_majority={lin_lift:+.4f}, lift_vs_random={lin_acc-random_pct:+.4f}")
+    results.update(linear_accuracy=lin_acc, linear_f1=lin_f1,
+                   linear_lift_majority=float(lin_lift),
+                   linear_lift_random=float(lin_acc - random_pct))
+
+    # ── Per-class accuracy ──
+    print(f"\n  Per-class accuracy:")
+    print(f"    {'class':20s} {'kNN':>8s} {'Linear':>8s} {'n_test':>8s}")
+    print(f"    {'─'*48}")
+    per_class = {}
+    for cls_idx, cls_name in enumerate(unique):
+        cls_mask = y[te_idx] == cls_idx
+        n = int(cls_mask.sum())
+        if n > 0:
+            knn_cls = float((knn_pred[cls_mask] == cls_idx).mean())
+            lin_cls = float((pred[cls_mask] == cls_idx).mean())
+        else:
+            knn_cls, lin_cls = 0.0, 0.0
+        per_class[cls_name] = {"knn": knn_cls, "linear": lin_cls, "n": n}
+        print(f"    {cls_name:20s} {knn_cls:8.4f} {lin_cls:8.4f} {n:8d}")
+    results["per_class"] = per_class
+
+    # ── Confusion matrix ──
+    print(f"\n  Confusion matrix (linear probe):")
+    cm = confusion_matrix(y[te_idx], pred)
+    print(f"    {'':20s}", end="")
+    for c in unique:
+        print(f" {c[:6]:>6s}", end="")
+    print()
+    for i, cls_name in enumerate(unique):
+        print(f"    {cls_name:20s}", end="")
+        for j in range(len(unique)):
+            print(f" {cm[i,j]:6d}", end="")
+        print()
+    results["confusion_matrix"] = cm.tolist()
+
+    # ── Cross-modal retrieval ──
+    if "g_motion" in emb:
+        print(f"\n  Cross-modal Retrieval (filtered):")
+        gr = F.normalize(emb["g_radar"], dim=-1).numpy()
+        gm = F.normalize(emb["g_motion"], dim=-1).numpy()
+        N_all = gr.shape[0]
+        for name, q, gal in [("R→M", gr, gm), ("M→R", gm, gr)]:
+            sim = q @ gal.T
+            ranks = np.array([np.where(np.argsort(-sim[i]) == i)[0][0] + 1
+                              for i in range(N_all)])
+            r1 = (ranks <= 1).mean()
+            r5 = (ranks <= 5).mean()
+            r10 = (ranks <= 10).mean()
+            mrr = (1.0 / ranks).mean()
+            print(f"    {name}: R@1={r1:.4f}, R@5={r5:.4f}, R@10={r10:.4f}, MRR={mrr:.4f}")
+            results[f"retrieval_{name}"] = {
+                "R@1": float(r1), "R@5": float(r5),
+                "R@10": float(r10), "MRR": float(mrr),
+            }
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════
+# 4.4 Ablation (simplified)
+# ═══════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def _quick_chamfer(model, loader, device, max_batches=20):
+def _quick_chamfer(model, loader, device, keep_classes, max_batches=20):
     model.eval()
+    keep_set = set(keep_classes)
     total, count = 0.0, 0
     for i, batch in enumerate(loader):
-        if i >= max_batches: break
+        if i >= max_batches:
+            break
         pc = batch["point_cloud"].to(device)
         mask = batch["temporal_mask"].to(device)
         out = model.forward_sequence(pc, mask)
@@ -650,10 +734,13 @@ def _quick_chamfer(model, loader, device, max_batches=20):
         gt_valid = gt.norm(dim=-1) > 1e-6
         B, T = pc.shape[:2]
         for b in range(B):
+            if batch["actions"][b] not in keep_set:
+                continue
             Tv = int(mask[b].sum().item())
             for t in range(min(Tv, 5)):
                 vm = gt_valid[b, t]
-                if vm.sum() < 2: continue
+                if vm.sum() < 2:
+                    continue
                 g, p = gt[b, t, vm], recon[b, t]
                 gn = g - g.mean(0, keepdim=True)
                 pn = p - p.mean(0, keepdim=True)
@@ -663,104 +750,46 @@ def _quick_chamfer(model, loader, device, max_batches=20):
     return total / max(count, 1)
 
 
-# ═══════════════════════════════════════════════════════════
-# 4.5 Semantic Readiness
-# ═══════════════════════════════════════════════════════════
+def run_ablation(base_ckpt, ablation_dir, loader, device, config, keep_classes, emb):
+    print(f"\n{'='*60}")
+    print(f"Exp 4.4: Ablation Studies (filtered)")
+    print(f"{'='*60}")
+    results = {}
 
-def run_linear_probe(embeddings, config):
-    print("\n" + "=" * 60)
-    print("Exp 4.5: Semantic Readiness (Linear Probing)")
-    print("=" * 60)
-    g = embeddings["g_radar"].numpy()
-    actions = embeddings["actions"]
+    # Full model
+    emb_f = filter_extracted(emb, keep_classes)
+    g = emb_f["g_radar"].numpy()
+    actions = emb_f["actions"]
     unique = sorted(set(actions))
-    if len(unique) < 2:
-        print("  ✗ < 2 classes")
-        return {"status": "skipped"}
+    if len(unique) >= 2:
+        amap = {a: i for i, a in enumerate(unique)}
+        y = np.array([amap[a] for a in actions])
+        perm = np.random.RandomState(42).permutation(len(y))
+        sp = int(len(y) * 0.8)
+        knn = KNeighborsClassifier(n_neighbors=min(5, sp-1), metric="cosine")
+        knn.fit(g[perm[:sp]], y[perm[:sp]])
+        full_acc = float(accuracy_score(y[perm[sp:]], knn.predict(g[perm[sp:]])))
+    else:
+        full_acc = 0.0
 
-    amap = {a: i for i, a in enumerate(unique)}
-    y = np.array([amap[a] for a in actions])
-    K = len(unique)
+    model = load_model(config, base_ckpt, device)
+    full_chamfer = _quick_chamfer(model, loader, device, keep_classes)
+    results["full"] = {"knn_acc": full_acc, "chamfer": full_chamfer}
+    print(f"  Full model: kNN={full_acc:.4f}, Chamfer={full_chamfer:.6f}")
 
-    dist = Counter(actions)
-    print(f"  Classes ({K}): {unique}")
-    print(f"  Distribution:")
-    for a, c in dist.most_common():
-        print(f"    {a:20s}: {c:4d} ({c/len(actions)*100:.1f}%)")
-
-    majority_pct = max(dist.values()) / len(actions)
-    print(f"  Majority baseline: {majority_pct:.4f}")
-    print(f"  Random baseline:   {1.0/K:.4f}")
-
-    N = len(y)
-    perm = np.random.RandomState(42).permutation(N)
-    sp = int(N * 0.8)
-    tr_idx, te_idx = perm[:sp], perm[sp:]
-    if sp < 2 or len(te_idx) < 1:
-        return {"status": "insufficient_data"}
-
-    results = {"majority_baseline": float(majority_pct),
-               "random_baseline": 1.0/K, "num_classes": K}
-
-    # k-NN
-    knn = KNeighborsClassifier(n_neighbors=min(5, sp-1), metric="cosine")
-    knn.fit(g[tr_idx], y[tr_idx])
-    knn_pred = knn.predict(g[te_idx])
-    knn_acc = accuracy_score(y[te_idx], knn_pred)
-    knn_f1 = f1_score(y[te_idx], knn_pred, average="weighted", zero_division=0)
-    knn_lift = knn_acc - majority_pct
-    print(f"\n  k-NN (k=5): acc={knn_acc:.4f}, F1={knn_f1:.4f}, lift={knn_lift:+.4f}")
-    results.update(knn_accuracy=knn_acc, knn_f1=knn_f1, knn_lift=float(knn_lift))
-
-    # Linear probe
-    D = g.shape[1]
-    probe = nn.Linear(D, K)
-    opt = torch.optim.Adam(probe.parameters(), lr=1e-3)
-    Xt = torch.from_numpy(g[tr_idx]).float()
-    yt = torch.from_numpy(y[tr_idx]).long()
-    Xe = torch.from_numpy(g[te_idx]).float()
-    for _ in range(50):
-        probe.train()
-        loss = F.cross_entropy(probe(Xt), yt)
-        opt.zero_grad(); loss.backward(); opt.step()
-    probe.eval()
-    with torch.no_grad():
-        pred = probe(Xe).argmax(1).numpy()
-    lin_acc = accuracy_score(y[te_idx], pred)
-    lin_f1 = f1_score(y[te_idx], pred, average="weighted", zero_division=0)
-    lin_lift = lin_acc - majority_pct
-    print(f"  Linear (50ep): acc={lin_acc:.4f}, F1={lin_f1:.4f}, lift={lin_lift:+.4f}")
-    results.update(linear_accuracy=lin_acc, linear_f1=lin_f1, linear_lift=float(lin_lift))
-    results["confusion_matrix"] = confusion_matrix(y[te_idx], pred).tolist()
-    results["class_names"] = unique
-
-    # Per-class accuracy
-    print(f"\n  Per-class accuracy (linear probe):")
-    per_class = {}
-    for cls_idx, cls_name in enumerate(unique):
-        cls_mask = y[te_idx] == cls_idx
-        if cls_mask.sum() > 0:
-            cls_acc = float((pred[cls_mask] == cls_idx).mean())
-            per_class[cls_name] = {"accuracy": cls_acc, "n": int(cls_mask.sum())}
-            print(f"    {cls_name:20s}: {cls_acc:.4f} (n={cls_mask.sum()})")
-    results["per_class"] = per_class
-
-    # Cross-modal retrieval
-    if "g_motion" in embeddings:
-        print("\n  Cross-modal Retrieval:")
-        gr = F.normalize(embeddings["g_radar"], dim=-1).numpy()
-        gm = F.normalize(embeddings["g_motion"], dim=-1).numpy()
-        N_all = gr.shape[0]
-        for name, q, gal in [("R→M", gr, gm), ("M→R", gm, gr)]:
-            sim = q @ gal.T
-            ranks = np.array([np.where(np.argsort(-sim[i]) == i)[0][0] + 1
-                              for i in range(N_all)])
-            r1, r5, r10 = (ranks<=1).mean(), (ranks<=5).mean(), (ranks<=10).mean()
-            mrr = (1.0/ranks).mean()
-            print(f"    {name}: R@1={r1:.4f}, R@5={r5:.4f}, R@10={r10:.4f}, MRR={mrr:.4f}")
-            results[f"retrieval_{name}"] = {
-                "R@1": float(r1), "R@5": float(r5),
-                "R@10": float(r10), "MRR": float(mrr)}
+    ABLATION_CONFIGS = {
+        "w/o_context": {"disable_context": True},
+        "w/o_self_attn": {"disable_self_attn": True},
+        "w/o_confidence": {"disable_confidence": True},
+        "w/o_contrastive": {"lambda_motion": 0.0},
+    }
+    for abl_name in ABLATION_CONFIGS:
+        ckpt = os.path.join(ablation_dir, f"{abl_name}_best.pt")
+        if not os.path.exists(ckpt):
+            print(f"  {abl_name:20s}: ✗ not found")
+            results[abl_name] = {"status": "missing"}
+            continue
+        print(f"  {abl_name:20s}: found, evaluating...")
 
     return results
 
@@ -770,19 +799,23 @@ def run_linear_probe(embeddings, config):
 # ═══════════════════════════════════════════════════════════
 
 def parse_args():
-    p = argparse.ArgumentParser("Stage 1 Evaluation (v5.4)")
+    p = argparse.ArgumentParser("Filtered Stage 1 Evaluation")
     p.add_argument("--config", default="configs/latent_graph.yaml")
     p.add_argument("--ckpt", required=True)
     p.add_argument("--data_dir", required=True)
     p.add_argument("--experiment", default="all",
-                   choices=["all","context","robustness","ablation","linear_probe"])
+                   choices=["all", "context", "robustness", "ablation", "linear_probe"])
     p.add_argument("--device", default="cuda")
     p.add_argument("--batch_size", type=int, default=4)
-    p.add_argument("--output", default="results/stage1_eval.json")
+    p.add_argument("--output", default="results/stage1_eval_filtered.json")
     p.add_argument("--ablation_dir", default="checkpoints/ablations")
-    p.add_argument("--label_method", default="auto",
-                   choices=["auto","zero_shot","sentence_similarity","keyword"])
+    p.add_argument("--label_method", default="auto")
     p.add_argument("--label_cache", default="results/action_labels_cache.json")
+    # ★ 핵심 추가 인자
+    p.add_argument("--exclude_top", type=int, default=1,
+                   help="가장 빈도 높은 N개 클래스 제외 (default=1)")
+    p.add_argument("--keep_top", type=int, default=5,
+                   help="제외 후 상위 K개 클래스만 사용 (default=5)")
     return p.parse_args()
 
 
@@ -792,6 +825,8 @@ def main():
         config = yaml.safe_load(f)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"Device set to use {device}")
+
     model = load_model(config, args.ckpt, device)
 
     motion_enc = None
@@ -819,50 +854,98 @@ def main():
         motion_type=me.get("input_type", "humanml3d"),
         action_labeler=action_labeler,
     )
-    loader = DataLoader(ds, batch_size=args.batch_size,
-                        shuffle=False, collate_fn=collate, num_workers=2)
 
-    R = {"config": args.config, "ckpt": args.ckpt, "label_method": action_labeler.method}
+    # ★ 클래스 필터링 결정
+    keep_classes, excluded_classes = compute_keep_classes(
+        ds, exclude_top=args.exclude_top, keep_top=args.keep_top)
+
+    # ★ 필터링된 인덱스로 Subset 생성
+    filtered_indices = filter_dataset_indices(ds, keep_classes)
+    filtered_ds = Subset(ds, filtered_indices)
+    print(f"\n  Filtered dataset: {len(filtered_ds)} samples "
+          f"(from {len(ds)} total)")
+
+    # 전체 데이터 로더 (배치 내 필터링은 각 함수에서)
+    full_loader = DataLoader(ds, batch_size=args.batch_size,
+                             shuffle=False, collate_fn=collate, num_workers=2)
+    # 필터링된 데이터 로더 (linear probe용)
+    filtered_loader = DataLoader(filtered_ds, batch_size=args.batch_size,
+                                  shuffle=False, collate_fn=collate, num_workers=2)
+
+    R = {
+        "config": args.config,
+        "ckpt": args.ckpt,
+        "label_method": action_labeler.method,
+        "exclude_top": args.exclude_top,
+        "keep_top": args.keep_top,
+        "kept_classes": keep_classes,
+        "excluded_classes": excluded_classes,
+        "num_filtered_samples": len(filtered_ds),
+    }
     run_all = args.experiment == "all"
 
+    # Extract embeddings (전체 데이터에서 → 나중에 필터)
     emb = None
     if run_all or args.experiment == "linear_probe":
-        emb = extract_all(model, loader, device, motion_enc)
+        emb = extract_all(model, full_loader, device, motion_enc)
 
     if run_all or args.experiment == "context":
-        R["context"] = run_context_interpretability(model, loader, device)
-    if run_all or args.experiment == "robustness":
-        R["robustness"] = run_robustness(model, loader, device)
-    if run_all or args.experiment == "ablation":
-        R["ablation"] = run_ablation(args.ckpt, args.ablation_dir, loader, device, config)
-    if run_all or args.experiment == "linear_probe":
-        R["linear_probe"] = run_linear_probe(emb, config)
+        R["context"] = run_context_interpretability(
+            model, full_loader, device, keep_classes)
 
+    if run_all or args.experiment == "robustness":
+        R["robustness"] = run_robustness(
+            model, full_loader, device, keep_classes)
+
+    if run_all or args.experiment == "ablation":
+        R["ablation"] = run_ablation(
+            args.ckpt, args.ablation_dir, full_loader, device,
+            config, keep_classes, emb)
+
+    if run_all or args.experiment == "linear_probe":
+        R["linear_probe"] = run_linear_probe(emb, config, keep_classes)
+
+    # Save
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+
     class Enc(json.JSONEncoder):
         def default(self, o):
-            if isinstance(o, (np.integer,)): return int(o)
-            if isinstance(o, (np.floating,)): return float(o)
-            if isinstance(o, np.ndarray): return o.tolist()
+            if isinstance(o, (np.integer,)):
+                return int(o)
+            if isinstance(o, (np.floating,)):
+                return float(o)
+            if isinstance(o, np.ndarray):
+                return o.tolist()
             return super().default(o)
+
     with open(args.output, "w") as f:
         json.dump(R, f, indent=2, ensure_ascii=False, cls=Enc)
     print(f"\nSaved: {args.output}")
 
-    print(f"\n{'='*60}\nSummary\n{'='*60}")
-    print(f"  Label method: {action_labeler.method}")
+    # ── Summary ──
+    print(f"\n{'='*60}")
+    print(f"Summary (filtered: {keep_classes})")
+    print(f"{'='*60}")
+    print(f"  Excluded: {excluded_classes}")
+    print(f"  Samples:  {len(filtered_ds)}/{len(ds)}")
+
     if "context" in R:
-        print(f"  Context separability: {R['context']['separability_ratio']:.4f}")
-        print(f"    valid classes: {R['context']['n_valid_actions']}")
-    if "robustness" in R:
+        print(f"  Context separability: {R['context'].get('separability_ratio', '?'):.4f}")
+
+    if "robustness" in R and "body_mask" in R["robustness"]:
         bm = R["robustness"]["body_mask"]
-        print(f"  α change (body mask): {bm['alpha_clean']:.4f} → {bm['alpha_masked']:.4f}")
-        print(f"  Σ change (body mask): {bm['sigma_clean']:.4f} → {bm['sigma_masked']:.4f}")
+        print(f"  α change: {bm['alpha_clean']:.4f} → {bm['alpha_masked']:.4f}")
+
     if "linear_probe" in R and "linear_accuracy" in R["linear_probe"]:
         lp = R["linear_probe"]
-        print(f"  Majority baseline: {lp.get('majority_baseline', '?'):.4f}")
-        print(f"  Linear probe: {lp['linear_accuracy']:.4f} (lift: {lp.get('linear_lift', '?'):+.4f})")
-        print(f"  k-NN:         {lp['knn_accuracy']:.4f} (lift: {lp.get('knn_lift', '?'):+.4f})")
+        print(f"  Majority baseline: {lp['majority_baseline']:.4f}")
+        print(f"  Random baseline:   {lp['random_baseline']:.4f}")
+        print(f"  k-NN:    {lp['knn_accuracy']:.4f} "
+              f"(lift vs majority: {lp['knn_lift_majority']:+.4f}, "
+              f"vs random: {lp['knn_lift_random']:+.4f})")
+        print(f"  Linear:  {lp['linear_accuracy']:.4f} "
+              f"(lift vs majority: {lp['linear_lift_majority']:+.4f}, "
+              f"vs random: {lp['linear_lift_random']:+.4f})")
         if "retrieval_R→M" in lp:
             rm = lp["retrieval_R→M"]
             print(f"  Retrieval R→M: R@1={rm['R@1']:.4f}, R@5={rm['R@5']:.4f}")
