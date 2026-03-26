@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Latent Graph Dynamics — v6.0 Training Script
+Latent Graph Dynamics — v7.0 Training Script
 
-v5.x → v6.0 변경사항:
-  - NodeDiagnostics 통합: 매 epoch 노드 분화 상태 자동 체크
-  - metric_div 진단 로깅 추가 (loss가 아닌 모니터링 지표)
-  - 학습 초반 node collapse 감지 시 경고
-  - train_history에 node diagnostics 포함
+v6.0 → v7.0 changes:
+  [new] motion_seq + motion_mask를 forward에 직접 전달 (mean pooling 제거)
+  [new] loss_rm_global + loss_rm_token 이중 contrastive 로깅
+  [new] MotionSemanticHead가 motion sequence에서 K개 token 추출
+  [new] NodeAwareReadout: node별 temporal pool → K semantic tokens
 
-사용법:
-  python scripts/train_latent_graph_v6.py --config configs/latent_graph.yaml
+Loss: L_obs + β·L_KL + λ_m·L_rm_global + λ_t·L_rm_token
+      [+ λ_ph·L_phase] [+ λ_d·L_div]
+
+Usage:
+  python scripts/train_latent_graph.py --config configs/latent_graph.yaml
 """
 
 import os
@@ -19,15 +22,14 @@ import yaml
 import json
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# ★ v6 모델 import (기존 모델 대신)
 from models.latent_graph_dynamics import (
     LatentGraphDynamicsModel,
     InteractionPseudoLabeler,
@@ -37,7 +39,7 @@ from models.motion_encoder import build_motion_encoder
 
 
 # ============================================================
-# Dataset (기존과 동일)
+# Dataset
 # ============================================================
 
 class RadarMotionDataset(Dataset):
@@ -76,7 +78,8 @@ class RadarMotionDataset(Dataset):
         T_m = min(motion.shape[0], self.max_motion_frames)
         motion = motion[:T_m]
         motion_dim = motion.shape[-1]
-        motion_padded = np.zeros((self.max_motion_frames, motion_dim), dtype=np.float32)
+        motion_padded = np.zeros((self.max_motion_frames, motion_dim),
+                                  dtype=np.float32)
         motion_padded[:T_m] = motion
         motion_mask = np.zeros(self.max_motion_frames, dtype=np.bool_)
         motion_mask[:T_m] = True
@@ -149,33 +152,38 @@ def _generate_batch_phase_labels(motion_joints_list, T_radar, labeler, device):
     return torch.stack(all_labels).to(device), torch.stack(all_conf).to(device)
 
 
+def _align_motion_mask(motion_mask_bool, T_mot, device):
+    """motion_enc 출력 길이와 mask 길이 맞추기."""
+    T_mask = motion_mask_bool.shape[1]
+    if T_mask > T_mot:
+        return motion_mask_bool[:, :T_mot]
+    elif T_mask < T_mot:
+        B = motion_mask_bool.shape[0]
+        pad = torch.zeros(B, T_mot - T_mask, dtype=torch.bool, device=device)
+        return torch.cat([motion_mask_bool, pad], dim=1)
+    return motion_mask_bool
+
+
 # ============================================================
-# ★ Enhanced Diagnostics Logger
+# Diagnostics
 # ============================================================
 
 @torch.no_grad()
 def run_full_diagnostics(model, batch, device, epoch, step=0):
-    """
-    매 epoch 끝에 한 배치로 전체 진단 수행.
-    노드 분화 상태 + 추가 통계.
-    """
     model.eval()
     pc = batch["point_cloud"].to(device)
     mask = batch["radar_mask"].to(device)
 
     out = model.forward_sequence(pc, mask)
-
-    # ── NodeDiagnostics (기본) ──
     node_report = model.get_diagnostics(out, mask)
     NodeDiagnostics.log(node_report, epoch, step)
 
-    # ── 추가 통계 ──
-    node_seq = out["node_history"]       # (B, T, M, D)
-    conf_seq = out["confidence"]         # (B, T, M, 1)
+    node_seq = out["node_history"]
+    conf_seq = out["confidence"]
     B, T, M, D = node_seq.shape
 
-    # Query diversity (학습된 node_queries 간 유사도)
-    queries = model.node_queries.squeeze(0)  # (M, D)
+    # Query diversity
+    queries = model.node_queries.squeeze(0)
     q_norm = F.normalize(queries, dim=-1)
     q_sim = (q_norm @ q_norm.t())
     q_eye = torch.eye(M, device=q_sim.device)
@@ -183,38 +191,48 @@ def run_full_diagnostics(model, batch, device, epoch, step=0):
     node_report["query_cosine_sim"] = float(q_off.item())
 
     # Per-node mean confidence
-    conf_per_node = conf_seq.squeeze(-1).mean(dim=(0, 1))  # (M,)
+    conf_per_node = conf_seq.squeeze(-1).mean(dim=(0, 1))
     node_report["per_node_confidence"] = conf_per_node.tolist()
 
-    # Temporal consistency: node 간 role이 시간에 따라 유지되는지
-    # 각 프레임에서 가장 높은 confidence의 node index
-    argmax_nodes = conf_seq.squeeze(-1).argmax(dim=2)  # (B, T)
-    # 연속 프레임 간 같은 node가 선택되는 비율
+    # Temporal role consistency
+    argmax_nodes = conf_seq.squeeze(-1).argmax(dim=2)
     if T > 1:
         same_node = (argmax_nodes[:, 1:] == argmax_nodes[:, :-1]).float().mean()
     else:
-        same_node = 1.0
-    node_report["temporal_role_consistency"] = float(same_node.item() if isinstance(same_node, torch.Tensor) else same_node)
+        same_node = torch.tensor(1.0)
+    node_report["temporal_role_consistency"] = float(same_node.item())
 
-    # FiLM diversity: transition의 gamma가 node별로 얼마나 다른지
-    # (이미 forward 끝났으므로 context_history에서 간접 확인)
-    ctx = out["context_history"]  # (B, T, ctx_dim)
+    # Context temporal std
+    ctx = out["context_history"]
     ctx_std = ctx.std(dim=1).mean()
     node_report["context_temporal_std"] = float(ctx_std.item())
 
-    # ── 상세 출력 ──
-    print(f"  [NodeDiag Extended] ep{epoch}:")
-    print(f"    query_cos_sim={q_off:.4f} (low=good)")
-    print(f"    per_node_conf={[f'{c:.3f}' for c in conf_per_node.tolist()]}")
-    print(f"    temporal_role_consistency={node_report['temporal_role_consistency']:.3f} "
-          f"(1.0=always same node wins, low=dynamic)")
-    print(f"    context_temporal_std={ctx_std:.4f}")
+    # Token attention diversity (v7.0 신규)
+    if "token_attn" in out and out["token_attn"] is not None:
+        attn = out["token_attn"]  # (B, K, M)
+        # 각 token이 다른 node에 attend하는지
+        attn_entropy = -(attn * (attn + 1e-10).log()).sum(dim=-1).mean()
+        node_report["token_attn_entropy"] = float(attn_entropy.item())
+        # token 간 attention 패턴 유사도
+        attn_norm = F.normalize(attn, dim=-1)  # (B, K, M)
+        tok_sim = torch.bmm(attn_norm, attn_norm.transpose(1, 2))  # (B, K, K)
+        K = attn.shape[1]
+        tok_eye = torch.eye(K, device=tok_sim.device).unsqueeze(0)
+        tok_off = (tok_sim * (1 - tok_eye)).abs().mean()
+        node_report["token_pattern_similarity"] = float(tok_off.item())
 
-    # ── 경고 ──
+    print(f"  [NodeDiag Extended] ep{epoch}:")
+    print(f"    query_cos_sim={q_off:.4f}")
+    print(f"    per_node_conf={[f'{c:.3f}' for c in conf_per_node.tolist()]}")
+    print(f"    temporal_role_consistency={node_report['temporal_role_consistency']:.3f}")
+    print(f"    context_temporal_std={ctx_std:.4f}")
+    if "token_attn_entropy" in node_report:
+        print(f"    token_attn_entropy={node_report['token_attn_entropy']:.4f} "
+              f"token_pattern_sim={node_report.get('token_pattern_similarity', 0):.4f}")
+
     if node_report["node_cosine_sim"] > 0.85 and epoch >= 5:
-        print(f"  ⚠⚠⚠ WARNING: Node collapse detected at epoch {epoch}! "
+        print(f"  ⚠⚠⚠ WARNING: Node collapse at epoch {epoch}! "
               f"cos_sim={node_report['node_cosine_sim']:.4f}")
-        print(f"       Consider: increase init_rounds, reduce beta_kl, or check L_obs trend")
 
     model.train()
     return node_report
@@ -226,7 +244,8 @@ def run_full_diagnostics(model, batch, device, epoch, step=0):
 
 def train(config, args):
     print("\n" + "=" * 60)
-    print("Stage 1: Latent Graph Dynamics Training — v6.0")
+    print("Stage 1: Latent Graph Dynamics Training — v7.0")
+    print("  NodeAwareReadout + Token-Level Contrastive")
     print("=" * 60)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -238,21 +257,23 @@ def train(config, args):
     # ── Model ──
     model = LatentGraphDynamicsModel(config).to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Latent Graph Model v6.0: {total_params:,} params")
+    print(f"Model: {total_params:,} params")
     print(f"  Nodes: {model.num_nodes}, dim: {model.node_dim}")
-    print(f"  Context: {model.ctx_dim}D, history K={model.ctx_history_len}")
+    print(f"  Semantic queries: {model.num_semantic_queries}")
     print(f"  Output: {model.out_dim}D")
-    print(f"  Queue size: {model.queue_size}")
-    print(f"  Loss: L_obs + {model.beta_kl}·L_KL + {model.lambda_motion}·L_rm + {model.lambda_diversity}·L_div")
+    print(f"  Loss: L_obs + {model.beta_kl}·L_KL "
+          f"+ {model.lambda_motion}·L_rm_global "
+          f"+ {model.lambda_token}·L_rm_token"
+          f"{f' + {model.lambda_diversity}·L_div' if model.lambda_diversity > 0 else ''}")
+    print(f"  Contrastive temp: {model.contrastive_temp}")
 
-    # ── 초기 node query 상태 확인 ──
+    # Initial query check
     queries = model.node_queries.squeeze(0)
     q_norm = F.normalize(queries, dim=-1)
     q_sim = (q_norm @ q_norm.t())
     q_eye = torch.eye(model.num_nodes, device=q_sim.device)
     init_sim = (q_sim * (1 - q_eye)).abs().mean()
-    print(f"  Initial query cos_sim: {init_sim:.4f} "
-          f"(orthogonal init → should be ~0)")
+    print(f"  Initial query cos_sim: {init_sim:.4f}")
 
     # ── Motion Encoder ──
     motion_enc = build_motion_encoder(config).to(device)
@@ -263,8 +284,7 @@ def train(config, args):
     optimizer = optim.AdamW(
         all_params,
         lr=float(lg_cfg["lr"]),
-        weight_decay=float(lg_cfg.get("weight_decay", 1e-2)),
-    )
+        weight_decay=float(lg_cfg.get("weight_decay", 1e-2)))
 
     # ── Scheduler ──
     total_epochs = lg_cfg["epochs"]
@@ -286,16 +306,15 @@ def train(config, args):
         max_motion_frames=ds_cfg.get("max_motion_frames", 300),
         points_per_frame=ds_cfg.get("points_per_frame", 128),
         point_dims=point_dims,
-        motion_input_type=mi_type,
-    )
+        motion_input_type=mi_type)
     val_ds = RadarMotionDataset(
         ds_cfg["val_dir"],
         max_radar_frames=ds_cfg.get("max_seq_len", 100),
         max_motion_frames=ds_cfg.get("max_motion_frames", 300),
         points_per_frame=ds_cfg.get("points_per_frame", 128),
         point_dims=point_dims,
-        motion_input_type=mi_type,
-    )
+        motion_input_type=mi_type)
+
     train_loader = DataLoader(
         train_ds, batch_size=lg_cfg["batch_size"],
         shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True)
@@ -308,20 +327,33 @@ def train(config, args):
     history = []
     diag_history = []
     phase_labeler = InteractionPseudoLabeler()
-    diag_every = log_cfg.get("diag_every", 5)  # 진단 주기
+    diag_every = log_cfg.get("diag_every", 5)
+
+    # ── Resume from checkpoint ──
+    start_epoch = 0
+    if args.resume:
+        ckpt_path = args.resume
+        if os.path.exists(ckpt_path):
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if "motion_enc_state_dict" in ckpt:
+                motion_enc.load_state_dict(ckpt["motion_enc_state_dict"], strict=False)
+            start_epoch = ckpt.get("epoch", 0) + 1
+            print(f"  Resumed from {ckpt_path}, starting epoch {start_epoch}")
+        else:
+            print(f"  ⚠ Resume checkpoint not found: {ckpt_path}")
+
 
     # ============================================================
     # Training Loop
     # ============================================================
 
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         model.train()
         motion_enc.train()
 
-        loss_keys = ["total", "obs", "kl", "rm", "phase"]
-        metric_keys = ["metric_div"]  # diagnostic only, not in loss
-        losses = {k: 0.0 for k in loss_keys}
-        metrics = {k: 0.0 for k in metric_keys}
+        losses = {k: 0.0 for k in
+                  ["total", "obs", "kl", "rm_global", "rm_token", "phase", "div"]}
         num_batches = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs}")
@@ -330,22 +362,34 @@ def train(config, args):
             radar_mask = batch["radar_mask"].to(device)
             motion = batch["motion"].to(device)
 
-            F_mot = motion_enc(motion)
-            m_mask = batch["motion_mask"].to(device).float()
-            T_out = F_mot.shape[1]
-            m_mask = F.adaptive_max_pool1d(
-                m_mask.unsqueeze(1), T_out).squeeze(1)
-            g_motion = (F_mot * m_mask.unsqueeze(-1)).sum(dim=1) / \
-                       m_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            # ── Motion encoder → sequence (not mean-pooled) ──
+            F_mot = motion_enc(motion)  # (B, T', feat_dim)
+            motion_mask_bool = batch["motion_mask"].to(device).bool()
+            T_mot = F_mot.shape[1]
+            motion_mask_bool = _align_motion_mask(
+                motion_mask_bool, T_mot, device)
 
+            # ── Phase pseudo-labels ──
             T_radar = pc.shape[1]
             phase_labels, phase_conf = _generate_batch_phase_labels(
                 batch["motion_joints"], T_radar, phase_labeler, device)
 
-            out = model(pc, motion_features=g_motion,
+            # ── Forward (v7.0: motion_seq + motion_mask) ──
+            out = model(pc,
+                        motion_seq=F_mot,
+                        motion_mask=motion_mask_bool,
                         temporal_mask=radar_mask,
                         phase_labels=phase_labels,
                         phase_confidence=phase_conf)
+
+            # ── NaN check ──
+            if torch.isnan(out["loss"]):
+                print(f"\n  === NaN at batch {num_batches} ===")
+                print(f"    obs={out['loss_obs'].item():.4f} "
+                      f"kl={out['loss_kl'].item():.4f} "
+                      f"rm_g={out['loss_rm_global'].item():.4f} "
+                      f"rm_t={out['loss_rm_token'].item():.4f}")
+                continue
 
             optimizer.zero_grad()
             out["loss"].backward()
@@ -354,21 +398,21 @@ def train(config, args):
             optimizer.step()
 
             losses["total"] += out["loss"].item()
-            for k in loss_keys[1:]:
-                key = f"loss_{k}"
-                if key in out:
-                    losses[k] += out[key].item()
-            # Diagnostic metric (not in loss)
-            if "metric_div" in out:
-                metrics["metric_div"] += out["metric_div"].item()
+            losses["obs"] += out["loss_obs"].item()
+            losses["kl"] += out["loss_kl"].item()
+            losses["rm_global"] += out["loss_rm_global"].item()
+            losses["rm_token"] += out["loss_rm_token"].item()
+            losses["phase"] += out["loss_phase"].item()
+            losses["div"] += out["metric_div"].item()
             num_batches += 1
 
             if num_batches % log_cfg.get("log_every", 10) == 0:
                 pbar.set_postfix(
                     loss=f"{out['loss'].item():.4f}",
                     obs=f"{out['loss_obs'].item():.4f}",
-                    div=f"{out['metric_div'].item():.4f}",  # diagnostic
-                )
+                    rm_g=f"{out['loss_rm_global'].item():.4f}",
+                    rm_t=f"{out['loss_rm_token'].item():.4f}",
+                    div=f"{out['metric_div'].item():.4f}")
 
         # ── Scheduler ──
         if epoch < warmup and warmup_scheduler is not None:
@@ -388,25 +432,28 @@ def train(config, args):
                 pc = batch["point_cloud"].to(device)
                 mask = batch["radar_mask"].to(device)
                 motion = batch["motion"].to(device)
+
                 F_mot = motion_enc(motion)
-                m_mask = batch["motion_mask"].to(device).float()
-                T_out = F_mot.shape[1]
-                m_mask = F.adaptive_max_pool1d(
-                    m_mask.unsqueeze(1), T_out).squeeze(1)
-                g_motion = (F_mot * m_mask.unsqueeze(-1)).sum(dim=1) / \
-                           m_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+                motion_mask_bool = batch["motion_mask"].to(device).bool()
+                T_mot = F_mot.shape[1]
+                motion_mask_bool = _align_motion_mask(
+                    motion_mask_bool, T_mot, device)
 
                 T_radar = pc.shape[1]
                 phase_labels, phase_conf = _generate_batch_phase_labels(
                     batch["motion_joints"], T_radar, phase_labeler, device)
 
-                out = model(pc, motion_features=g_motion,
+                out = model(pc,
+                            motion_seq=F_mot,
+                            motion_mask=motion_mask_bool,
                             temporal_mask=mask,
                             phase_labels=phase_labels,
                             phase_confidence=phase_conf)
-                val_loss += out["loss"].item()
-                val_batches += 1
-                last_val_batch = batch  # 진단용
+
+                if not torch.isnan(out["loss"]):
+                    val_loss += out["loss"].item()
+                    val_batches += 1
+                last_val_batch = batch
 
         val_avg = val_loss / max(val_batches, 1)
         n = max(num_batches, 1)
@@ -416,40 +463,36 @@ def train(config, args):
               f"loss={losses['total']/n:.4f} "
               f"(obs={losses['obs']/n:.4f} "
               f"kl={losses['kl']/n:.4f} "
-              f"rm={losses['rm']/n:.4f} "
+              f"rm_g={losses['rm_global']/n:.4f} "
+              f"rm_t={losses['rm_token']/n:.4f} "
               f"phase={losses['phase']/n:.4f}) "
               f"val={val_avg:.4f} lr={lr:.2e} "
-              f"| div_metric={metrics['metric_div']/n:.4f}")
+              f"| div={losses['div']/n:.4f}")
 
         epoch_record = {
             "epoch": epoch + 1,
             "train_loss": losses["total"] / n,
             "train_obs": losses["obs"] / n,
             "train_kl": losses["kl"] / n,
-            "train_rm": losses["rm"] / n,
+            "train_rm_global": losses["rm_global"] / n,
+            "train_rm_token": losses["rm_token"] / n,
             "train_phase": losses["phase"] / n,
             "val_loss": val_avg,
             "lr": lr,
-            "metric_div": metrics["metric_div"] / n,  # diagnostic
+            "metric_div": losses["div"] / n,
         }
 
-        # ════════════════════════════════════════════════
-        # ★ Node Differentiation Diagnostics
-        # ════════════════════════════════════════════════
+        # ── Diagnostics ──
         if (epoch + 1) % diag_every == 0 and last_val_batch is not None:
             diag_report = run_full_diagnostics(
                 model, last_val_batch, device, epoch + 1)
             epoch_record["node_diagnostics"] = diag_report
-            diag_history.append({
-                "epoch": epoch + 1,
-                **diag_report,
-            })
+            diag_history.append({"epoch": epoch + 1, **diag_report})
 
-            # ── 학습 상태 판단 ──
             cos_sim = diag_report["node_cosine_sim"]
             if cos_sim > 0.9 and epoch > 10:
-                print(f"  ⚠ Node collapse persists — structural fixes may need tuning")
-                print(f"    Try: increase init_rounds, or reduce beta_kl")
+                print(f"  ⚠ Node collapse persists — "
+                      f"consider increasing lambda_token or lambda_diversity")
 
         history.append(epoch_record)
 
@@ -482,43 +525,48 @@ def train(config, args):
     with open(os.path.join(args.output_dir, "train_history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
-    # ── Node diagnostics history ──
     with open(os.path.join(args.output_dir, "node_diag_history.json"), "w") as f:
         json.dump(diag_history, f, indent=2)
 
-    # ════════════════════════════════════════════════
-    # ★ Final Summary with Node Health Check
-    # ════════════════════════════════════════════════
+    # ── Final Summary ──
     print(f"\n{'='*60}")
-    print(f"Training Complete — v6.0")
+    print(f"Training Complete — v7.0")
     print(f"{'='*60}")
     print(f"  Best val loss: {best_val:.4f}")
     print(f"  Checkpoints: {args.output_dir}")
 
     if diag_history:
-        first_diag = diag_history[0]
-        last_diag = diag_history[-1]
+        first = diag_history[0]
+        last = diag_history[-1]
         print(f"\n  Node Differentiation Progress:")
-        print(f"    cos_sim:  {first_diag['node_cosine_sim']:.4f} → "
-              f"{last_diag['node_cosine_sim']:.4f} "
-              f"({'↓ improved' if last_diag['node_cosine_sim'] < first_diag['node_cosine_sim'] else '↑ degraded'})")
-        print(f"    node_std: {first_diag['node_std']:.4f} → "
-              f"{last_diag['node_std']:.4f} "
-              f"({'↑ improved' if last_diag['node_std'] > first_diag['node_std'] else '↓ degraded'})")
-        print(f"    role_ent: {first_diag['role_entropy_normalized']:.4f} → "
-              f"{last_diag['role_entropy_normalized']:.4f} "
-              f"({'↑ improved' if last_diag['role_entropy_normalized'] > first_diag['role_entropy_normalized'] else '↓ degraded'})")
+        print(f"    cos_sim:  {first['node_cosine_sim']:.4f} → "
+              f"{last['node_cosine_sim']:.4f} "
+              f"({'↓ improved' if last['node_cosine_sim'] < first['node_cosine_sim'] else '↑ degraded'})")
+        print(f"    node_std: {first['node_std']:.4f} → "
+              f"{last['node_std']:.4f} "
+              f"({'↑ improved' if last['node_std'] > first['node_std'] else '↓ degraded'})")
+        print(f"    role_ent: {first['role_entropy_normalized']:.4f} → "
+              f"{last['role_entropy_normalized']:.4f} "
+              f"({'↑ improved' if last['role_entropy_normalized'] > first['role_entropy_normalized'] else '↓ degraded'})")
 
-        if last_diag['node_cosine_sim'] > 0.8:
-            print(f"\n  ⚠ Nodes are still poorly differentiated (cos_sim={last_diag['node_cosine_sim']:.3f})")
-            print(f"    Suggestions:")
-            print(f"    - Increase init_rounds (currently {config['latent_graph'].get('init_rounds', 3)})")
-            print(f"    - Reduce beta_kl (currently {model.beta_kl})")
-            print(f"    - Check if L_obs is decreasing (reconstruction pressure drives specialization)")
-        elif last_diag['node_cosine_sim'] < 0.4:
-            print(f"\n  ★ Nodes are well differentiated! (cos_sim={last_diag['node_cosine_sim']:.3f})")
+        if "token_attn_entropy" in last:
+            print(f"    token_attn_entropy: "
+                  f"{first.get('token_attn_entropy', 0):.4f} → "
+                  f"{last['token_attn_entropy']:.4f}")
+            print(f"    token_pattern_sim:  "
+                  f"{first.get('token_pattern_similarity', 0):.4f} → "
+                  f"{last.get('token_pattern_similarity', 0):.4f} "
+                  f"(low=tokens read different nodes)")
+
+        if last['node_cosine_sim'] > 0.8:
+            print(f"\n  ⚠ Nodes poorly differentiated "
+                  f"(cos_sim={last['node_cosine_sim']:.3f})")
+        elif last['node_cosine_sim'] < 0.4:
+            print(f"\n  ★ Nodes well differentiated! "
+                  f"(cos_sim={last['node_cosine_sim']:.3f})")
         else:
-            print(f"\n  ○ Moderate node differentiation (cos_sim={last_diag['node_cosine_sim']:.3f})")
+            print(f"\n  ○ Moderate differentiation "
+                  f"(cos_sim={last['node_cosine_sim']:.3f})")
 
     print(f"{'='*60}")
 
@@ -529,10 +577,12 @@ def train(config, args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Latent Graph Dynamics v6.0 Training")
+        description="Latent Graph Dynamics v7.0 Training")
     parser.add_argument("--config", default="configs/latent_graph.yaml")
     parser.add_argument("--output_dir", default="checkpoints/latent_graph")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--resume", default=None,
+                    help="Path to checkpoint to resume from")
     return parser.parse_args()
 
 
