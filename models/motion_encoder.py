@@ -13,7 +13,23 @@ T2M-GPT VQ-VAE encoder를 기반으로 하되, 학습 가능 여부는 config에
 import torch
 import torch.nn as nn
 
+class MotionEncoder(nn.Module):
+    def __init__(self, input_dim=201, feat_dim=512, **kwargs):
+        super().__init__()
+        self.input_dim = input_dim
+        self.feat_dim = feat_dim
+        self.proj = nn.Sequential(
+            nn.Linear(input_dim, feat_dim),
+            nn.LayerNorm(feat_dim),
+            nn.GELU(),
+            nn.Linear(feat_dim, feat_dim))
 
+    def forward(self, x):
+        # x: (B, T, 201) → (B, T, 512)
+        return self.proj(x)
+
+
+'''
 class MotionEncoder(nn.Module):
     """
     1D Conv temporal encoder.
@@ -60,7 +76,7 @@ class MotionEncoder(nn.Module):
         h = self.temporal(h.transpose(1, 2))  # (B, width, T')
         h = h.transpose(1, 2)                # (B, T', width)
         return self.output_proj(h)            # (B, T', feat_dim)
-
+'''
 
 def build_motion_encoder(config):
     """

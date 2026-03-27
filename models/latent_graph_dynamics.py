@@ -825,7 +825,7 @@ class LatentGraphDynamicsModel(nn.Module):
 
         # Projection heads (for global contrastive)
         self.radar_proj = nn.Sequential(
-            nn.Linear(self.out_dim, self.out_dim), nn.GELU(),
+            nn.Linear(self.out_dim, self.out_dim), nn.LayerNorm(self.out_dim), nn.GELU(),
             nn.Linear(self.out_dim, self.out_dim))
         self.motion_proj = nn.Sequential(
             nn.Linear(self.out_dim, self.out_dim), nn.GELU(),

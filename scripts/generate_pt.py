@@ -21,10 +21,10 @@ RadarLLM 데이터셋 생성 (모션 데이터 포함 버전)
 사용법:
   python scripts/generate_pt.py \
       --mode hymotion \
-      --prompts_json HY-Motion-1.0/examples/gpt3000.json \
+      --prompts_json HY-Motion-1.0/examples/objgpt3000_copy.json \
       --hymotion_config HY-Motion-1.0/ckpts/tencent/HY-Motion-1.0/config.yml --hymotion_ckpt HY-Motion-1.0/ckpts/tencent/HY-Motion-1.0/latest.ckpt \
       --radar_config RF-Genesis/models/TI1843_config.json \
-      --output_dir data/radar_text_dataset/new_gpt_act_simple
+      --output_dir data/radar_text_dataset/new_gpt_act_obj
       
 
 
@@ -274,7 +274,7 @@ def generate_from_hymotion(args):
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
-    temp_dir = os.path.abspath(os.path.join(args.output_dir, "_temp"))
+    temp_dir = os.path.abspath(os.path.join(args.output_dir, "_temp1"))
     os.makedirs(temp_dir, exist_ok=True)
     index = []
 
