@@ -18,6 +18,10 @@
 
 !/scripts/
 
+!/models2/
+
+!/pipelines/
+
 
 # Radar Captioning Pipeline
 #!/radar_captioning/
